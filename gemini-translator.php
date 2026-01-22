@@ -134,13 +134,220 @@ function gt_scan_products() {
     return $scanned;
 }
 
+// Scan Elementor content
+function gt_scan_elementor() {
+    global $wpdb;
+    
+    $language = get_option('gt_target_language');
+    $inserted = 0;
+    
+    // Get all posts with Elementor data
+    $posts_with_elementor = $wpdb->get_results("
+        SELECT post_id, meta_value 
+        FROM {$wpdb->postmeta} 
+        WHERE meta_key = '_elementor_data' 
+        AND meta_value != ''
+    ");
+    
+    foreach ($posts_with_elementor as $post) {
+        $elementor_data = json_decode($post->meta_value, true);
+        
+        if (is_array($elementor_data)) {
+            $strings = gt_extract_elementor_strings($elementor_data, $post->post_id);
+            
+            foreach ($strings as $string_data) {
+                if (!empty($string_data['text'])) {
+                    $was_inserted = gt_insert_string(
+                        $string_data['text'],
+                        $string_data['context'],
+                        'elementor',
+                        $post->post_id,
+                        $language
+                    );
+                    if ($was_inserted) {
+                        $inserted++;
+                    }
+                }
+            }
+        }
+    }
+    
+    return $inserted;
+}
+
+// Extract strings from Elementor data recursively
+function gt_extract_elementor_strings($elements, $post_id, $strings = []) {
+    foreach ($elements as $element) {
+        // Get widget type
+        $widget_type = $element['widgetType'] ?? $element['elType'] ?? 'unknown';
+        
+        // Extract settings
+        if (isset($element['settings'])) {
+            $settings = $element['settings'];
+            
+            // Heading widget
+            if (isset($settings['title'])) {
+                $strings[] = [
+                    'text' => $settings['title'],
+                    'context' => 'elementor_heading',
+                ];
+            }
+            
+            // Text editor widget
+            if (isset($settings['editor'])) {
+                $strings[] = [
+                    'text' => $settings['editor'],
+                    'context' => 'elementor_text',
+                ];
+            }
+            
+            // Button widget
+            if (isset($settings['text'])) {
+                $strings[] = [
+                    'text' => $settings['text'],
+                    'context' => 'elementor_button',
+                ];
+            }
+            
+            // Image box widget
+            if (isset($settings['title_text'])) {
+                $strings[] = [
+                    'text' => $settings['title_text'],
+                    'context' => 'elementor_image_box_title',
+                ];
+            }
+            if (isset($settings['description_text'])) {
+                $strings[] = [
+                    'text' => $settings['description_text'],
+                    'context' => 'elementor_image_box_desc',
+                ];
+            }
+            
+            // Icon box widget
+            if (isset($settings['title_text'])) {
+                $strings[] = [
+                    'text' => $settings['title_text'],
+                    'context' => 'elementor_icon_box_title',
+                ];
+            }
+            
+            // Call to action
+            if (isset($settings['title'])) {
+                $strings[] = [
+                    'text' => $settings['title'],
+                    'context' => 'elementor_cta_title',
+                ];
+            }
+            if (isset($settings['description'])) {
+                $strings[] = [
+                    'text' => $settings['description'],
+                    'context' => 'elementor_cta_desc',
+                ];
+            }
+            
+            // Testimonial
+            if (isset($settings['testimonial_content'])) {
+                $strings[] = [
+                    'text' => $settings['testimonial_content'],
+                    'context' => 'elementor_testimonial',
+                ];
+            }
+            if (isset($settings['testimonial_name'])) {
+                $strings[] = [
+                    'text' => $settings['testimonial_name'],
+                    'context' => 'elementor_testimonial_name',
+                ];
+            }
+            
+            // Accordion / Toggle
+            if (isset($settings['tabs']) && is_array($settings['tabs'])) {
+                foreach ($settings['tabs'] as $tab) {
+                    if (isset($tab['tab_title'])) {
+                        $strings[] = [
+                            'text' => $tab['tab_title'],
+                            'context' => 'elementor_accordion_title',
+                        ];
+                    }
+                    if (isset($tab['tab_content'])) {
+                        $strings[] = [
+                            'text' => $tab['tab_content'],
+                            'context' => 'elementor_accordion_content',
+                        ];
+                    }
+                }
+            }
+            
+            // Price list
+            if (isset($settings['price_list']) && is_array($settings['price_list'])) {
+                foreach ($settings['price_list'] as $item) {
+                    if (isset($item['title'])) {
+                        $strings[] = [
+                            'text' => $item['title'],
+                            'context' => 'elementor_price_title',
+                        ];
+                    }
+                    if (isset($item['item_description'])) {
+                        $strings[] = [
+                            'text' => $item['item_description'],
+                            'context' => 'elementor_price_desc',
+                        ];
+                    }
+                }
+            }
+        }
+        
+        // Recursively process child elements
+        if (isset($element['elements']) && is_array($element['elements'])) {
+            $strings = gt_extract_elementor_strings($element['elements'], $post_id, $strings);
+        }
+    }
+    
+    return $strings;
+}
+
 // Insert string if not exists
+// Insert string if not exists (with filtering)
 function gt_insert_string($string, $context, $source_type, $source_id, $language) {
     global $wpdb;
+    
+    // Clean the string
+    $string = trim($string);
+    
+    // Skip empty strings
+    if (empty($string)) {
+        return false;
+    }
+    
+    // Skip very short strings (less than 2 characters)
+    if (mb_strlen(strip_tags($string)) < 2) {
+        return false;
+    }
+    
+    // Skip strings that are only numbers
+    if (is_numeric(strip_tags($string))) {
+        return false;
+    }
+    
+    // Skip strings that are only HTML without text
+    $text_only = trim(strip_tags($string));
+    if (empty($text_only)) {
+        return false;
+    }
+    
+    // Skip URLs
+    if (filter_var($string, FILTER_VALIDATE_URL)) {
+        return false;
+    }
+    
+    // Skip email addresses
+    if (filter_var($string, FILTER_VALIDATE_EMAIL)) {
+        return false;
+    }
     
     $table_name = $wpdb->prefix . 'gt_translations';
     $string_hash = md5($string);
     
+    // Check if already exists (any source, same string)
     $exists = $wpdb->get_var($wpdb->prepare(
         "SELECT id FROM $table_name WHERE string_hash = %s AND language_code = %s",
         $string_hash,
@@ -157,7 +364,18 @@ function gt_insert_string($string, $context, $source_type, $source_id, $language
             'source_id' => $source_id,
             'status' => 'pending',
         ]);
+        return true;
     }
+    
+    return false;
+}
+
+// Clear all Elementor strings (for re-scanning)
+function gt_clear_elementor_strings() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'gt_translations';
+    
+    return $wpdb->delete($table_name, ['source_type' => 'elementor']);
 }
 
 // Test API connection
@@ -388,6 +606,16 @@ function gt_handle_actions() {
         
         add_settings_error('gt_messages', 'gt_save_success', 'Translation saved!', 'success');
     }
+
+    if (isset($_POST['gt_scan_elementor']) && check_admin_referer('gt_scan_elementor_action')) {
+        $count = gt_scan_elementor();
+        add_settings_error('gt_messages', 'gt_scan_elementor_success', "Scanned $count strings from Elementor.", 'success');
+    }
+
+    if (isset($_POST['gt_clear_elementor']) && check_admin_referer('gt_clear_elementor_action')) {
+    $deleted = gt_clear_elementor_strings();
+    add_settings_error('gt_messages', 'gt_clear_success', "Cleared Elementor strings. Ready to re-scan.", 'success');
+}
 }
 add_action('admin_init', 'gt_handle_actions');
 
@@ -398,10 +626,42 @@ function gt_admin_page() {
     $language = get_option('gt_target_language');
     $table_name = $wpdb->prefix . 'gt_translations';
     
+    // General stats
     $total_strings = $wpdb->get_var("SELECT COUNT(*) FROM $table_name");
-    $pending = $wpdb->get_var("SELECT COUNT(*) FROM $table_name WHERE status = 'pending'");
-    $translated = $wpdb->get_var("SELECT COUNT(*) FROM $table_name WHERE status = 'translated'");
-    $edited = $wpdb->get_var("SELECT COUNT(*) FROM $table_name WHERE status = 'edited'");
+    $total_pending = $wpdb->get_var("SELECT COUNT(*) FROM $table_name WHERE status = 'pending'");
+    $total_translated = $wpdb->get_var("SELECT COUNT(*) FROM $table_name WHERE status = 'translated'");
+    $total_edited = $wpdb->get_var("SELECT COUNT(*) FROM $table_name WHERE status = 'edited'");
+    
+    // Stats by source
+    $sources = [
+        'product' => ['label' => 'WooCommerce', 'icon' => '🛒'],
+        'elementor' => ['label' => 'Elementor', 'icon' => '📄'],
+        'wcfm' => ['label' => 'WCFM', 'icon' => '🏪'],
+    ];
+    
+    $stats_by_source = [];
+    foreach ($sources as $source_type => $source_info) {
+        $stats_by_source[$source_type] = [
+            'label' => $source_info['label'],
+            'icon' => $source_info['icon'],
+            'total' => $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM $table_name WHERE source_type = %s", 
+                $source_type
+            )),
+            'pending' => $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM $table_name WHERE source_type = %s AND status = 'pending'", 
+                $source_type
+            )),
+            'translated' => $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM $table_name WHERE source_type = %s AND status = 'translated'", 
+                $source_type
+            )),
+            'edited' => $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM $table_name WHERE source_type = %s AND status = 'edited'", 
+                $source_type
+            )),
+        ];
+    }
     
     settings_errors('gt_messages');
     ?>
@@ -417,64 +677,112 @@ function gt_admin_page() {
                 <p>✅ Ready to translate to <strong><?php echo strtoupper($language); ?></strong></p>
             </div>
             
-            <!-- Stats -->
+            <!-- General Stats -->
+            <h2>Overview</h2>
             <div style="display: flex; gap: 20px; margin: 20px 0; flex-wrap: wrap;">
                 <div class="card" style="padding: 15px; min-width: 120px;">
                     <h3 style="margin: 0; font-size: 32px;"><?php echo $total_strings; ?></h3>
                     <p style="margin: 5px 0 0;">Total strings</p>
                 </div>
                 <div class="card" style="padding: 15px; min-width: 120px;">
-                    <h3 style="margin: 0; font-size: 32px; color: #f0ad4e;"><?php echo $pending; ?></h3>
+                    <h3 style="margin: 0; font-size: 32px; color: #f0ad4e;"><?php echo $total_pending; ?></h3>
                     <p style="margin: 5px 0 0;">Pending</p>
                 </div>
                 <div class="card" style="padding: 15px; min-width: 120px;">
-                    <h3 style="margin: 0; font-size: 32px; color: #5cb85c;"><?php echo $translated; ?></h3>
+                    <h3 style="margin: 0; font-size: 32px; color: #5cb85c;"><?php echo $total_translated; ?></h3>
                     <p style="margin: 5px 0 0;">Translated</p>
                 </div>
                 <div class="card" style="padding: 15px; min-width: 120px;">
-                    <h3 style="margin: 0; font-size: 32px; color: #0073aa;"><?php echo $edited; ?></h3>
+                    <h3 style="margin: 0; font-size: 32px; color: #0073aa;"><?php echo $total_edited; ?></h3>
                     <p style="margin: 5px 0 0;">Edited</p>
                 </div>
             </div>
             
+            <!-- Stats by Source -->
+            <h2>By Source</h2>
+            <table class="wp-list-table widefat fixed striped" style="max-width: 600px;">
+                <thead>
+                    <tr>
+                        <th>Source</th>
+                        <th style="text-align: center;">Total</th>
+                        <th style="text-align: center;">Pending</th>
+                        <th style="text-align: center;">Translated</th>
+                        <th style="text-align: center;">Edited</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($stats_by_source as $source_type => $stats): ?>
+                        <?php if ($stats['total'] > 0): ?>
+                        <tr>
+                            <td><?php echo $stats['icon']; ?> <?php echo $stats['label']; ?></td>
+                            <td style="text-align: center;"><?php echo $stats['total']; ?></td>
+                            <td style="text-align: center;">
+                                <span style="color: #f0ad4e; font-weight: bold;"><?php echo $stats['pending']; ?></span>
+                            </td>
+                            <td style="text-align: center;">
+                                <span style="color: #5cb85c; font-weight: bold;"><?php echo $stats['translated']; ?></span>
+                            </td>
+                            <td style="text-align: center;">
+                                <span style="color: #0073aa; font-weight: bold;"><?php echo $stats['edited']; ?></span>
+                            </td>
+                        </tr>
+                        <?php endif; ?>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+            
             <!-- Actions -->
+            <h2 style="margin-top: 30px;">Actions</h2>
             <div style="display: flex; gap: 20px; flex-wrap: wrap;">
                 <div class="card" style="padding: 20px; min-width: 280px;">
-                    <h2 style="margin-top: 0;">1. Scan Content</h2>
-                    <p>Detect translatable strings from your products.</p>
-                    <form method="post">
+                    <h3 style="margin-top: 0;">1. Scan Content</h3>
+                    <p>Detect translatable strings from your site.</p>
+                    <form method="post" style="display: flex; flex-direction: column; gap: 10px;">
                         <?php wp_nonce_field('gt_scan_action'); ?>
                         <button type="submit" name="gt_scan" class="button button-secondary">
-                            Scan Products
+                            🛒 Scan WooCommerce Products
+                        </button>
+                    </form>
+                    <form method="post" style="margin-top: 10px;">
+                        <?php wp_nonce_field('gt_scan_elementor_action'); ?>
+                        <button type="submit" name="gt_scan_elementor" class="button button-secondary">
+                            📄 Scan Elementor Pages
+                        </button>
+                    </form>
+                    <form method="post" style="margin-top: 10px;">
+                        <?php wp_nonce_field('gt_clear_elementor_action'); ?>
+                        <button type="submit" name="gt_clear_elementor" class="button button-link-delete" 
+                            onclick="return confirm('This will delete all Elementor strings. Continue?');">
+                            Clear Elementor Strings
                         </button>
                     </form>
                 </div>
                 
                 <div class="card" style="padding: 20px; min-width: 280px;">
-                    <h2 style="margin-top: 0;">2. Translate</h2>
+                    <h3 style="margin-top: 0;">2. Translate</h3>
                     <p>Translate pending strings using Gemini AI.</p>
                     <form method="post" style="display: flex; gap: 10px; flex-wrap: wrap;">
                         <?php wp_nonce_field('gt_translate_action'); ?>
-                        <button type="submit" name="gt_translate" class="button button-secondary" <?php echo $pending == 0 ? 'disabled' : ''; ?>>
+                        <button type="submit" name="gt_translate" class="button button-secondary" <?php echo $total_pending == 0 ? 'disabled' : ''; ?>>
                             Translate Batch (20)
                         </button>
                     </form>
                     <form method="post" style="margin-top: 10px;">
                         <?php wp_nonce_field('gt_translate_all_action'); ?>
-                        <button type="submit" name="gt_translate_all" class="button button-primary" <?php echo $pending == 0 ? 'disabled' : ''; ?>
-                            onclick="return confirm('This will translate all <?php echo $pending; ?> pending strings. This may take a while. Continue?');">
-                            Translate All (<?php echo $pending; ?> strings)
+                        <button type="submit" name="gt_translate_all" class="button button-primary" <?php echo $total_pending == 0 ? 'disabled' : ''; ?>
+                            onclick="return confirm('This will translate all <?php echo $total_pending; ?> pending strings. This may take a while. Continue?');">
+                            Translate All (<?php echo $total_pending; ?> strings)
                         </button>
                     </form>
-                    <?php if ($pending > 0): ?>
+                    <?php if ($total_pending > 0): ?>
                         <p class="description" style="margin-top: 10px;">
-                            ⏱️ Estimated time: ~<?php echo ceil($pending * 0.5 / 60); ?> minutes
+                            ⏱️ Estimated time: ~<?php echo ceil($total_pending * 0.5 / 60); ?> minutes
                         </p>
                     <?php endif; ?>
                 </div>
                 
                 <div class="card" style="padding: 20px; min-width: 280px;">
-                    <h2 style="margin-top: 0;">3. Review & Edit</h2>
+                    <h3 style="margin-top: 0;">3. Review & Edit</h3>
                     <p>Review and edit your translations.</p>
                     <a href="<?php echo admin_url('admin.php?page=gemini-translator-list'); ?>" class="button button-primary">
                         View Translations
@@ -482,7 +790,7 @@ function gt_admin_page() {
                 </div>
                 
                 <div class="card" style="padding: 20px; min-width: 280px;">
-                    <h2 style="margin-top: 0;">Test API</h2>
+                    <h3 style="margin-top: 0;">Test API</h3>
                     <p>Verify your Gemini API connection.</p>
                     <form method="post">
                         <?php wp_nonce_field('gt_test_api_action'); ?>
