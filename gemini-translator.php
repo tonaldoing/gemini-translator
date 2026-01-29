@@ -90,47 +90,170 @@ function gt_admin_menu() {
         'gemini-translator-settings',
         'gt_settings_page'
     );
+
+    add_submenu_page(
+        'gemini-translator',
+        'Switcher Style',
+        'Switcher Style',
+        'manage_options',
+        'gemini-translator-switcher',
+        'gt_switcher_style_page'
+    );
 }
 add_action('admin_menu', 'gt_admin_menu');
 
 // Register settings
 function gt_register_settings() {
     register_setting('gt_settings', 'gt_api_key');
+    register_setting('gt_settings', 'gt_source_language');
     register_setting('gt_settings', 'gt_target_language');
+
+    // Switcher style settings
+    register_setting('gt_switcher_settings', 'gt_switcher_style', [
+        'type' => 'array',
+        'default' => gt_get_default_switcher_style(),
+        'sanitize_callback' => 'gt_sanitize_switcher_style',
+    ]);
 }
 add_action('admin_init', 'gt_register_settings');
 
-// Scan WooCommerce products
-function gt_scan_products() {
-    global $wpdb;
-    
-    $table_name = $wpdb->prefix . 'gt_translations';
-    $language = get_option('gt_target_language');
-    $scanned = 0;
-    
-    $products = get_posts([
-        'post_type' => 'product',
-        'post_status' => 'publish',
-        'numberposts' => -1,
-    ]);
-    
-    foreach ($products as $product) {
-        if (!empty($product->post_title)) {
-            gt_insert_string($product->post_title, 'product_title', 'product', $product->ID, $language);
-            $scanned++;
-        }
-        
-        if (!empty($product->post_content)) {
-            gt_insert_string($product->post_content, 'product_description', 'product', $product->ID, $language);
-            $scanned++;
-        }
-        
-        if (!empty($product->post_excerpt)) {
-            gt_insert_string($product->post_excerpt, 'product_short_description', 'product', $product->ID, $language);
-            $scanned++;
+function gt_get_default_switcher_style() {
+    return [
+        'bg_color'          => '#ffffff',
+        'text_color'        => '#333333',
+        'active_bg_color'   => '#0073aa',
+        'active_text_color' => '#ffffff',
+        'hover_bg_color'    => '#f0f0f0',
+        'hover_text_color'  => '#0073aa',
+        'border_color'      => '#dddddd',
+        'border_radius'     => '6',
+        'font_size'         => '14',
+        'padding_h'         => '16',
+        'padding_v'         => '8',
+        'gap'               => '0',
+        'position'          => 'none',       // none, bottom-right, bottom-left, top-right, top-left
+        'shadow'            => '1',
+        'label_format'      => 'name',      // name, code, both
+    ];
+}
+
+function gt_sanitize_switcher_style($input) {
+    $defaults = gt_get_default_switcher_style();
+    $clean = [];
+
+    $color_fields = ['bg_color', 'text_color', 'active_bg_color', 'active_text_color', 'hover_bg_color', 'hover_text_color', 'border_color'];
+    foreach ($color_fields as $field) {
+        $clean[$field] = isset($input[$field]) ? sanitize_hex_color($input[$field]) : $defaults[$field];
+        if (empty($clean[$field])) {
+            $clean[$field] = $defaults[$field];
         }
     }
-    
+
+    $number_fields = ['border_radius', 'font_size', 'padding_h', 'padding_v', 'gap'];
+    foreach ($number_fields as $field) {
+        $clean[$field] = isset($input[$field]) ? max(0, intval($input[$field])) : $defaults[$field];
+    }
+
+    $allowed_positions = ['none', 'bottom-right', 'bottom-left', 'top-right', 'top-left'];
+    $clean['position'] = isset($input['position']) && in_array($input['position'], $allowed_positions) ? $input['position'] : $defaults['position'];
+
+    $clean['shadow'] = isset($input['shadow']) ? '1' : '0';
+
+    $allowed_formats = ['name', 'code', 'both'];
+    $clean['label_format'] = isset($input['label_format']) && in_array($input['label_format'], $allowed_formats) ? $input['label_format'] : $defaults['label_format'];
+
+    return $clean;
+}
+
+function gt_get_switcher_style() {
+    $style = get_option('gt_switcher_style');
+    if (!is_array($style)) {
+        return gt_get_default_switcher_style();
+    }
+    return array_merge(gt_get_default_switcher_style(), $style);
+}
+
+function gt_format_lang_label($lang_code, $lang_name, $format) {
+    switch ($format) {
+        case 'code':
+            return strtoupper($lang_code);
+        case 'both':
+            return strtoupper($lang_code) . ' - ' . $lang_name;
+        default:
+            return $lang_name;
+    }
+}
+
+// Get WordPress default language
+function gt_get_wp_language() {
+    $locale = get_locale();
+    $lang_code = substr($locale, 0, 2);
+    return $lang_code;
+}
+
+// Get source language (with fallback to WP language)
+function gt_get_source_language() {
+    $source = get_option('gt_source_language');
+    if (empty($source)) {
+        return gt_get_wp_language();
+    }
+    return $source;
+}
+
+// Get all available languages
+function gt_get_available_languages() {
+    return [
+        'en' => 'English',
+        'es' => 'Español',
+        'pt' => 'Português',
+        'fr' => 'Français',
+        'de' => 'Deutsch',
+        'it' => 'Italiano',
+        'nl' => 'Nederlands',
+        'pl' => 'Polski',
+        'ru' => 'Русский',
+        'zh' => '中文',
+        'ja' => '日本語',
+        'ko' => '한국어',
+        'ar' => 'العربية',
+    ];
+}
+
+// Scan WooCommerce products
+function gt_scan_products() {
+    $language = get_option('gt_target_language');
+    $scanned = 0;
+    $page = 1;
+    $batch_size = 50;
+
+    do {
+        $products = get_posts([
+            'post_type' => 'product',
+            'post_status' => 'publish',
+            'numberposts' => $batch_size,
+            'paged' => $page,
+        ]);
+
+        foreach ($products as $product) {
+            if (!empty($product->post_title)) {
+                gt_insert_string($product->post_title, 'product_title', 'product', $product->ID, $language);
+                $scanned++;
+            }
+
+            if (!empty($product->post_content)) {
+                gt_insert_string($product->post_content, 'product_description', 'product', $product->ID, $language);
+                $scanned++;
+            }
+
+            if (!empty($product->post_excerpt)) {
+                gt_insert_string($product->post_excerpt, 'product_short_description', 'product', $product->ID, $language);
+                $scanned++;
+            }
+        }
+
+        $page++;
+    } while (count($products) === $batch_size);
+
     return $scanned;
 }
 
@@ -223,21 +346,6 @@ function gt_extract_elementor_strings($elements, $post_id, $strings = []) {
                 ];
             }
             
-            // Icon box widget
-            if (isset($settings['title_text'])) {
-                $strings[] = [
-                    'text' => $settings['title_text'],
-                    'context' => 'elementor_icon_box_title',
-                ];
-            }
-            
-            // Call to action
-            if (isset($settings['title'])) {
-                $strings[] = [
-                    'text' => $settings['title'],
-                    'context' => 'elementor_cta_title',
-                ];
-            }
             if (isset($settings['description'])) {
                 $strings[] = [
                     'text' => $settings['description'],
@@ -305,7 +413,6 @@ function gt_extract_elementor_strings($elements, $post_id, $strings = []) {
     return $strings;
 }
 
-// Insert string if not exists
 // Insert string if not exists (with filtering)
 function gt_insert_string($string, $context, $source_type, $source_id, $language) {
     global $wpdb;
@@ -378,6 +485,38 @@ function gt_clear_elementor_strings() {
     return $wpdb->delete($table_name, ['source_type' => 'elementor']);
 }
 
+// Clear orphaned strings (from deleted pages/products)
+function gt_clear_orphaned_strings() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'gt_translations';
+    
+    // Get all source_ids from translations
+    $source_ids = $wpdb->get_col("SELECT DISTINCT source_id FROM $table_name WHERE source_id IS NOT NULL");
+    
+    $deleted_pages = 0;
+    $deleted_strings = 0;
+    
+    foreach ($source_ids as $source_id) {
+        // Check if post exists
+        $post_exists = get_post_status($source_id);
+        
+        if ($post_exists === false) {
+            // Count strings to delete
+            $count = $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM $table_name WHERE source_id = %d",
+                $source_id
+            ));
+            
+            // Post doesn't exist, delete translations
+            $wpdb->delete($table_name, ['source_id' => $source_id]);
+            $deleted_pages++;
+            $deleted_strings += $count;
+        }
+    }
+    
+    return ['pages' => $deleted_pages, 'strings' => $deleted_strings];
+}
+
 // Test API connection
 function gt_test_api_connection() {
     $api_key = get_option('gt_api_key');
@@ -386,17 +525,19 @@ function gt_test_api_connection() {
         return ['success' => false, 'message' => 'API key is empty'];
     }
     
-    $url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$api_key";
-    
+    $url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+
     $response = wp_remote_post($url, [
-        'headers' => ['Content-Type' => 'application/json'],
+        'headers' => [
+            'Content-Type' => 'application/json',
+            'x-goog-api-key' => $api_key,
+        ],
         'body' => json_encode([
             'contents' => [
                 ['parts' => [['text' => 'Say OK']]]
             ]
         ]),
         'timeout' => 60,
-        'sslverify' => false,
     ]);
     
     if (is_wp_error($response)) {
@@ -434,12 +575,19 @@ function gt_translate_with_gemini($text, $target_language) {
     }
     
     $language_names = [
+        'en' => 'English',
         'es' => 'Spanish',
         'pt' => 'Portuguese',
         'fr' => 'French',
         'de' => 'German',
         'it' => 'Italian',
-        'en' => 'English',
+        'nl' => 'Dutch',
+        'pl' => 'Polish',
+        'ru' => 'Russian',
+        'zh' => 'Chinese',
+        'ja' => 'Japanese',
+        'ko' => 'Korean',
+        'ar' => 'Arabic',
     ];
     
     $lang_name = $language_names[$target_language] ?? $target_language;
@@ -447,16 +595,18 @@ function gt_translate_with_gemini($text, $target_language) {
     $prompt = "Translate the following text to $lang_name. Return ONLY the translation, nothing else. Keep any HTML tags intact.\n\nText: $text";
     
     $response = wp_remote_post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$api_key",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
         [
-            'headers' => ['Content-Type' => 'application/json'],
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'x-goog-api-key' => $api_key,
+            ],
             'body' => json_encode([
                 'contents' => [
                     ['parts' => [['text' => $prompt]]]
                 ]
             ]),
             'timeout' => 60,
-            'sslverify' => false,
         ]
     );
     
@@ -520,34 +670,45 @@ function gt_translate_batch($limit = 10) {
     return ['translated' => $translated, 'errors' => $errors];
 }
 
-// Translate ALL pending strings
-function gt_translate_all() {
+// AJAX handler for batch translation
+function gt_ajax_translate_batch() {
+    check_ajax_referer('gt_ajax_translate', 'nonce');
+
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('Unauthorized');
+    }
+
+    $batch_size = isset($_POST['batch_size']) ? intval($_POST['batch_size']) : 10;
+    $result = gt_translate_batch($batch_size);
+
     global $wpdb;
-    
     $table_name = $wpdb->prefix . 'gt_translations';
     $language = get_option('gt_target_language');
-    
-    $total_pending = $wpdb->get_var($wpdb->prepare(
+    $remaining = $wpdb->get_var($wpdb->prepare(
         "SELECT COUNT(*) FROM $table_name WHERE status = 'pending' AND language_code = %s",
         $language
     ));
-    
-    $translated = 0;
-    $errors = [];
-    $batch_size = 10;
-    
-    while ($translated < $total_pending && count($errors) < 5) {
-        $result = gt_translate_batch($batch_size);
-        $translated += $result['translated'];
-        $errors = array_merge($errors, $result['errors']);
-        
-        if ($result['translated'] === 0 && !empty($result['errors'])) {
-            break;
-        }
-    }
-    
-    return ['translated' => $translated, 'errors' => $errors, 'total' => $total_pending];
+
+    wp_send_json_success([
+        'translated' => $result['translated'],
+        'errors' => $result['errors'],
+        'remaining' => intval($remaining),
+    ]);
 }
+add_action('wp_ajax_gt_translate_batch', 'gt_ajax_translate_batch');
+
+// Enqueue admin scripts
+function gt_admin_scripts($hook) {
+    if (strpos($hook, 'gemini-translator') === false) {
+        return;
+    }
+    wp_enqueue_script('gt-admin', GT_PLUGIN_URL . 'admin.js', ['jquery'], GT_VERSION, true);
+    wp_localize_script('gt-admin', 'gt_ajax', [
+        'url' => admin_url('admin-ajax.php'),
+        'nonce' => wp_create_nonce('gt_ajax_translate'),
+    ]);
+}
+add_action('admin_enqueue_scripts', 'gt_admin_scripts');
 
 // Handle actions
 function gt_handle_actions() {
@@ -573,19 +734,6 @@ function gt_handle_actions() {
         }
     }
     
-    if (isset($_POST['gt_translate_all']) && check_admin_referer('gt_translate_all_action')) {
-        $result = gt_translate_all();
-        if ($result['translated'] > 0) {
-            add_settings_error('gt_messages', 'gt_translate_success', "Translated {$result['translated']} of {$result['total']} strings.", 'success');
-        }
-        if (!empty($result['errors'])) {
-            $unique_errors = array_unique($result['errors']);
-            add_settings_error('gt_messages', 'gt_translate_errors', 'Errors: ' . implode(', ', $unique_errors), 'error');
-        }
-        if ($result['translated'] === 0 && empty($result['errors'])) {
-            add_settings_error('gt_messages', 'gt_translate_none', 'No strings to translate.', 'warning');
-        }
-    }
     
     // Handle inline edit save
     if (isset($_POST['gt_save_translation']) && check_admin_referer('gt_save_translation_action')) {
@@ -593,7 +741,7 @@ function gt_handle_actions() {
         $table_name = $wpdb->prefix . 'gt_translations';
         
         $id = intval($_POST['translation_id']);
-        $new_translation = sanitize_textarea_field($_POST['translated_string']);
+        $new_translation = wp_kses_post($_POST['translated_string']);
         
         $wpdb->update(
             $table_name,
@@ -613,9 +761,15 @@ function gt_handle_actions() {
     }
 
     if (isset($_POST['gt_clear_elementor']) && check_admin_referer('gt_clear_elementor_action')) {
-    $deleted = gt_clear_elementor_strings();
-    add_settings_error('gt_messages', 'gt_clear_success', "Cleared Elementor strings. Ready to re-scan.", 'success');
-}
+        gt_clear_elementor_strings();
+        add_settings_error('gt_messages', 'gt_clear_success', "Cleared Elementor strings. Ready to re-scan.", 'success');
+    }
+
+    if (isset($_POST['gt_clear_orphaned']) && check_admin_referer('gt_clear_orphaned_action')) {
+        $result = gt_clear_orphaned_strings();
+        add_settings_error('gt_messages', 'gt_clear_orphaned_success', 
+            "Cleared {$result['strings']} strings from {$result['pages']} deleted pages/products.", 'success');
+    }
 }
 add_action('admin_init', 'gt_handle_actions');
 
@@ -756,6 +910,14 @@ function gt_admin_page() {
                             Clear Elementor Strings
                         </button>
                     </form>
+
+                    <form method="post" style="margin-top: 5px;">
+                        <?php wp_nonce_field('gt_clear_orphaned_action'); ?>
+                        <button type="submit" name="gt_clear_orphaned" class="button button-link-delete button-small" 
+                            onclick="return confirm('Delete strings from deleted pages/products?');">
+                            🧹 Clear Orphaned Strings
+                        </button>
+                    </form>
                 </div>
                 
                 <div class="card" style="padding: 20px; min-width: 280px;">
@@ -767,18 +929,15 @@ function gt_admin_page() {
                             Translate Batch (20)
                         </button>
                     </form>
-                    <form method="post" style="margin-top: 10px;">
-                        <?php wp_nonce_field('gt_translate_all_action'); ?>
-                        <button type="submit" name="gt_translate_all" class="button button-primary" <?php echo $total_pending == 0 ? 'disabled' : ''; ?>
-                            onclick="return confirm('This will translate all <?php echo $total_pending; ?> pending strings. This may take a while. Continue?');">
-                            Translate All (<?php echo $total_pending; ?> strings)
+                    <div style="margin-top: 10px;">
+                        <button type="button" id="gt-translate-all-btn" class="button button-primary" <?php echo $total_pending == 0 ? 'disabled' : ''; ?>>
+                            Translate All (<span id="gt-remaining"><?php echo $total_pending; ?></span> strings)
                         </button>
-                    </form>
-                    <?php if ($total_pending > 0): ?>
-                        <p class="description" style="margin-top: 10px;">
-                            ⏱️ Estimated time: ~<?php echo ceil($total_pending * 0.5 / 60); ?> minutes
-                        </p>
-                    <?php endif; ?>
+                        <div id="gt-translate-progress" style="display:none; margin-top: 10px;">
+                            <progress id="gt-progress-bar" max="<?php echo $total_pending; ?>" value="0" style="width: 100%;"></progress>
+                            <p id="gt-progress-text" class="description"></p>
+                        </div>
+                    </div>
                 </div>
                 
                 <div class="card" style="padding: 20px; min-width: 280px;">
@@ -818,6 +977,8 @@ function gt_translations_page() {
     // Filters
     $status_filter = isset($_GET['status']) ? sanitize_text_field($_GET['status']) : '';
     $context_filter = isset($_GET['context']) ? sanitize_text_field($_GET['context']) : '';
+    $source_filter = isset($_GET['source_type']) ? sanitize_text_field($_GET['source_type']) : '';
+    $page_filter = isset($_GET['source_id']) ? intval($_GET['source_id']) : 0;
     $search = isset($_GET['s']) ? sanitize_text_field($_GET['s']) : '';
     
     // Build query
@@ -828,6 +989,12 @@ function gt_translations_page() {
     if ($context_filter) {
         $where .= $wpdb->prepare(" AND context = %s", $context_filter);
     }
+    if ($source_filter) {
+        $where .= $wpdb->prepare(" AND source_type = %s", $source_filter);
+    }
+    if ($page_filter) {
+        $where .= $wpdb->prepare(" AND source_id = %d", $page_filter);
+    }
     if ($search) {
         $where .= $wpdb->prepare(" AND (original_string LIKE %s OR translated_string LIKE %s)", '%' . $wpdb->esc_like($search) . '%', '%' . $wpdb->esc_like($search) . '%');
     }
@@ -837,10 +1004,34 @@ function gt_translations_page() {
     $total_pages = ceil($total_items / $per_page);
     
     // Get items
-    $items = $wpdb->get_results("SELECT * FROM $table_name $where ORDER BY id DESC LIMIT $offset, $per_page");
+    $items = $wpdb->get_results($wpdb->prepare("SELECT * FROM $table_name $where ORDER BY source_id, id DESC LIMIT %d, %d", $offset, $per_page));
     
     // Get available contexts for filter
     $contexts = $wpdb->get_col("SELECT DISTINCT context FROM $table_name ORDER BY context");
+    
+    // Get available source types for filter
+    $source_types = $wpdb->get_col("SELECT DISTINCT source_type FROM $table_name ORDER BY source_type");
+    
+    // Get pages/products with translations for filter
+    $pages_with_translations = $wpdb->get_results("
+        SELECT DISTINCT source_id, source_type 
+        FROM $table_name 
+        WHERE source_id IS NOT NULL 
+        ORDER BY source_type, source_id
+    ");
+    
+    // Build page options with titles
+    $page_options = [];
+    foreach ($pages_with_translations as $p) {
+        $title = get_the_title($p->source_id);
+        if (empty($title)) {
+            $title = "ID: {$p->source_id}";
+        }
+        $page_options[$p->source_id] = [
+            'title' => $title,
+            'type' => $p->source_type,
+        ];
+    }
     
     settings_errors('gt_messages');
     ?>
@@ -851,6 +1042,24 @@ function gt_translations_page() {
         <div class="tablenav top">
             <form method="get" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                 <input type="hidden" name="page" value="gemini-translator-list" />
+                
+                <select name="source_type">
+                    <option value="">All sources</option>
+                    <?php foreach ($source_types as $type): ?>
+                        <option value="<?php echo esc_attr($type); ?>" <?php selected($source_filter, $type); ?>>
+                            <?php echo esc_html(ucfirst($type)); ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+                
+                <select name="source_id">
+                    <option value="">All pages/products</option>
+                    <?php foreach ($page_options as $id => $info): ?>
+                        <option value="<?php echo esc_attr($id); ?>" <?php selected($page_filter, $id); ?>>
+                            <?php echo esc_html("[{$info['type']}] " . wp_trim_words($info['title'], 5)); ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
                 
                 <select name="status">
                     <option value="">All statuses</option>
@@ -872,7 +1081,7 @@ function gt_translations_page() {
                 
                 <button type="submit" class="button">Filter</button>
                 
-                <?php if ($status_filter || $context_filter || $search): ?>
+                <?php if ($status_filter || $context_filter || $search || $source_filter || $page_filter): ?>
                     <a href="<?php echo admin_url('admin.php?page=gemini-translator-list'); ?>" class="button">Clear</a>
                 <?php endif; ?>
             </form>
@@ -886,36 +1095,67 @@ function gt_translations_page() {
         <table class="wp-list-table widefat fixed striped">
             <thead>
                 <tr>
-                    <th style="width: 50px;">ID</th>
-                    <th style="width: 120px;">Context</th>
+                    <th style="width: 40px;">ID</th>
+                    <th style="width: 200px;">Page / Product</th>
+                    <th style="width: 100px;">Context</th>
                     <th>Original</th>
                     <th>Translation</th>
-                    <th style="width: 100px;">Status</th>
-                    <th style="width: 100px;">Actions</th>
+                    <th style="width: 80px;">Status</th>
+                    <th style="width: 80px;">Actions</th>
                 </tr>
             </thead>
             <tbody>
                 <?php if (empty($items)): ?>
                     <tr>
-                        <td colspan="6">No translations found.</td>
+                        <td colspan="7">No translations found.</td>
                     </tr>
                 <?php else: ?>
                     <?php foreach ($items as $item): ?>
+                        <?php 
+                        $page_title = get_the_title($item->source_id);
+                        $page_url = get_permalink($item->source_id);
+                        $edit_url = get_edit_post_link($item->source_id);
+                        ?>
                         <tr id="row-<?php echo $item->id; ?>">
                             <td><?php echo $item->id; ?></td>
                             <td>
-                                <span class="context-badge" style="background: #f0f0f0; padding: 2px 8px; border-radius: 3px; font-size: 12px;">
+                                <strong>
+                                    <?php if ($page_url): ?>
+                                        <a href="<?php echo esc_url($page_url); ?>" target="_blank" title="View page">
+                                            <?php echo esc_html(wp_trim_words($page_title, 5) ?: "ID: {$item->source_id}"); ?>
+                                        </a>
+                                    <?php else: ?>
+                                        <?php echo esc_html($page_title ?: "ID: {$item->source_id}"); ?>
+                                    <?php endif; ?>
+                                </strong>
+                                <div class="row-actions">
+                                    <span class="source-type" style="color: #666; font-size: 11px;">
+                                        <?php echo esc_html($item->source_type); ?>
+                                    </span>
+                                    <?php if ($page_url): ?>
+                                        | <a href="<?php echo esc_url($page_url); ?>" target="_blank" style="font-size: 11px;">View</a>
+                                    <?php endif; ?>
+                                    <?php if ($edit_url): ?>
+                                        | <a href="<?php echo esc_url($edit_url); ?>" target="_blank" style="font-size: 11px;">Edit</a>
+                                    <?php endif; ?>
+                                    | <a href="<?php echo admin_url("admin.php?page=gemini-translator-list&source_id={$item->source_id}"); ?>" style="font-size: 11px;">
+                                        Filter this page
+                                    </a>
+                                </div>
+                            </td>
+                            <td>
+                                <span class="context-badge" style="background: #f0f0f0; padding: 2px 8px; border-radius: 3px; font-size: 11px;">
                                     <?php echo esc_html($item->context); ?>
                                 </span>
                             </td>
                             <td>
-                                <div style="max-height: 100px; overflow-y: auto;">
-                                    <?php echo esc_html(wp_trim_words($item->original_string, 30)); ?>
+                                <div style="max-height: 80px; overflow-y: auto; font-size: 13px;">
+                                    <?php echo esc_html(wp_trim_words($item->original_string, 20)); ?>
                                 </div>
                             </td>
                             <td>
-                                <div class="translation-display" id="display-<?php echo $item->id; ?>" style="max-height: 100px; overflow-y: auto;">
-                                    <?php echo esc_html(wp_trim_words($item->translated_string, 30)); ?>
+                                <div class="translation-display" id="display-<?php echo $item->id; ?>" style="max-height: 80px; overflow-y: auto; font-size: 13px;">
+                                    <?php echo esc_html(wp_trim_words($item->translated_string, 20)); ?>
                                 </div>
                                 <form method="post" class="translation-form" id="form-<?php echo $item->id; ?>" style="display: none;">
                                     <?php wp_nonce_field('gt_save_translation_action'); ?>
@@ -936,7 +1176,7 @@ function gt_translations_page() {
                                 ];
                                 $color = $status_colors[$item->status] ?? '#999';
                                 ?>
-                                <span style="background: <?php echo $color; ?>; color: white; padding: 2px 8px; border-radius: 3px; font-size: 12px;">
+                                <span style="background: <?php echo $color; ?>; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px;">
                                     <?php echo esc_html($item->status); ?>
                                 </span>
                             </td>
@@ -973,7 +1213,6 @@ function gt_translations_page() {
     
     <script>
     jQuery(document).ready(function($) {
-        // Edit button click
         $('.edit-translation').on('click', function() {
             var id = $(this).data('id');
             $('#display-' + id).hide();
@@ -981,7 +1220,6 @@ function gt_translations_page() {
             $(this).hide();
         });
         
-        // Cancel button click
         $('.cancel-edit').on('click', function() {
             var id = $(this).data('id');
             $('#form-' + id).hide();
@@ -995,6 +1233,10 @@ function gt_translations_page() {
 
 // Settings page
 function gt_settings_page() {
+    $languages = gt_get_available_languages();
+    $wp_lang = gt_get_wp_language();
+    $source_lang = gt_get_source_language();
+    $target_lang = get_option('gt_target_language');
     ?>
     <div class="wrap">
         <h1>Translator Settings</h1>
@@ -1022,17 +1264,36 @@ function gt_settings_page() {
                 </tr>
                 <tr>
                     <th scope="row">
-                        <label for="gt_target_language">Target Language</label>
+                        <label for="gt_source_language">Site Original Language</label>
+                    </th>
+                    <td>
+                        <select id="gt_source_language" name="gt_source_language">
+                            <?php foreach ($languages as $code => $name): ?>
+                                <option value="<?php echo $code; ?>" <?php selected($source_lang, $code); ?>>
+                                    <?php echo $name; ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                        <p class="description">
+                            The original language of your site content. 
+                            WordPress detected: <strong><?php echo $languages[$wp_lang] ?? $wp_lang; ?></strong>
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">
+                        <label for="gt_target_language">Translate To</label>
                     </th>
                     <td>
                         <select id="gt_target_language" name="gt_target_language">
                             <option value="">Select language...</option>
-                            <option value="es" <?php selected(get_option('gt_target_language'), 'es'); ?>>Spanish</option>
-                            <option value="pt" <?php selected(get_option('gt_target_language'), 'pt'); ?>>Portuguese</option>
-                            <option value="fr" <?php selected(get_option('gt_target_language'), 'fr'); ?>>French</option>
-                            <option value="de" <?php selected(get_option('gt_target_language'), 'de'); ?>>German</option>
-                            <option value="it" <?php selected(get_option('gt_target_language'), 'it'); ?>>Italian</option>
-                            <option value="en" <?php selected(get_option('gt_target_language'), 'en'); ?>>English</option>
+                            <?php foreach ($languages as $code => $name): ?>
+                                <?php if ($code !== $source_lang): ?>
+                                    <option value="<?php echo $code; ?>" <?php selected($target_lang, $code); ?>>
+                                        <?php echo $name; ?>
+                                    </option>
+                                <?php endif; ?>
+                            <?php endforeach; ?>
                         </select>
                         <p class="description">Language to translate your content into</p>
                     </td>
@@ -1041,6 +1302,774 @@ function gt_settings_page() {
             
             <?php submit_button('Save Settings'); ?>
         </form>
+        
+        <hr>
+        
+        <h2>Language Info</h2>
+        <table class="widefat" style="max-width: 400px;">
+            <tr>
+                <td><strong>WordPress Locale:</strong></td>
+                <td><?php echo get_locale(); ?></td>
+            </tr>
+            <tr>
+                <td><strong>Site Language:</strong></td>
+                <td><?php echo $languages[$source_lang] ?? $source_lang; ?></td>
+            </tr>
+            <tr>
+                <td><strong>Target Language:</strong></td>
+                <td><?php echo $target_lang ? ($languages[$target_lang] ?? $target_lang) : 'Not set'; ?></td>
+            </tr>
+        </table>
     </div>
     <?php
 }
+
+// Switcher Style admin page
+function gt_switcher_style_page() {
+    $s = gt_get_switcher_style();
+    $source_lang = gt_get_source_language();
+    $target_lang = get_option('gt_target_language');
+    $languages = gt_get_available_languages();
+    $source_name = $languages[$source_lang] ?? $source_lang;
+    $target_name = $languages[$target_lang] ?? ($target_lang ?: 'Target');
+    $source_label = gt_format_lang_label($source_lang, $source_name, $s['label_format']);
+    $target_label = gt_format_lang_label($target_lang ?: 'xx', $target_name, $s['label_format']);
+
+    // Enqueue WP color picker
+    wp_enqueue_style('wp-color-picker');
+    wp_enqueue_script('wp-color-picker');
+    ?>
+    <div class="wrap">
+        <h1>Switcher Style</h1>
+        <p>Customize the appearance of the <code>[gt_language_switcher]</code> shortcode.</p>
+
+        <div style="display: flex; gap: 40px; align-items: flex-start; flex-wrap: wrap;">
+            <!-- Settings Form -->
+            <div style="flex: 1; min-width: 380px; max-width: 520px;">
+                <form method="post" action="options.php" id="gt-switcher-form">
+                    <?php settings_fields('gt_switcher_settings'); ?>
+
+                    <h2>Colors</h2>
+                    <table class="form-table">
+                        <tr>
+                            <th>Background</th>
+                            <td><input type="text" name="gt_switcher_style[bg_color]" value="<?php echo esc_attr($s['bg_color']); ?>" class="gt-color-field" data-var="bgColor" /></td>
+                        </tr>
+                        <tr>
+                            <th>Text Color</th>
+                            <td><input type="text" name="gt_switcher_style[text_color]" value="<?php echo esc_attr($s['text_color']); ?>" class="gt-color-field" data-var="textColor" /></td>
+                        </tr>
+                        <tr>
+                            <th>Active Background</th>
+                            <td><input type="text" name="gt_switcher_style[active_bg_color]" value="<?php echo esc_attr($s['active_bg_color']); ?>" class="gt-color-field" data-var="activeBgColor" /></td>
+                        </tr>
+                        <tr>
+                            <th>Active Text</th>
+                            <td><input type="text" name="gt_switcher_style[active_text_color]" value="<?php echo esc_attr($s['active_text_color']); ?>" class="gt-color-field" data-var="activeTextColor" /></td>
+                        </tr>
+                        <tr>
+                            <th>Hover Background</th>
+                            <td><input type="text" name="gt_switcher_style[hover_bg_color]" value="<?php echo esc_attr($s['hover_bg_color']); ?>" class="gt-color-field" data-var="hoverBgColor" /></td>
+                        </tr>
+                        <tr>
+                            <th>Hover Text</th>
+                            <td><input type="text" name="gt_switcher_style[hover_text_color]" value="<?php echo esc_attr($s['hover_text_color']); ?>" class="gt-color-field" data-var="hoverTextColor" /></td>
+                        </tr>
+                        <tr>
+                            <th>Border Color</th>
+                            <td><input type="text" name="gt_switcher_style[border_color]" value="<?php echo esc_attr($s['border_color']); ?>" class="gt-color-field" data-var="borderColor" /></td>
+                        </tr>
+                    </table>
+
+                    <h2>Dimensions</h2>
+                    <table class="form-table">
+                        <tr>
+                            <th>Border Radius (px)</th>
+                            <td><input type="number" name="gt_switcher_style[border_radius]" value="<?php echo esc_attr($s['border_radius']); ?>" min="0" max="50" class="small-text gt-range-field" data-var="borderRadius" /></td>
+                        </tr>
+                        <tr>
+                            <th>Font Size (px)</th>
+                            <td><input type="number" name="gt_switcher_style[font_size]" value="<?php echo esc_attr($s['font_size']); ?>" min="10" max="24" class="small-text gt-range-field" data-var="fontSize" /></td>
+                        </tr>
+                        <tr>
+                            <th>Horizontal Padding (px)</th>
+                            <td><input type="number" name="gt_switcher_style[padding_h]" value="<?php echo esc_attr($s['padding_h']); ?>" min="0" max="40" class="small-text gt-range-field" data-var="paddingH" /></td>
+                        </tr>
+                        <tr>
+                            <th>Vertical Padding (px)</th>
+                            <td><input type="number" name="gt_switcher_style[padding_v]" value="<?php echo esc_attr($s['padding_v']); ?>" min="0" max="30" class="small-text gt-range-field" data-var="paddingV" /></td>
+                        </tr>
+                        <tr>
+                            <th>Gap Between Buttons (px)</th>
+                            <td><input type="number" name="gt_switcher_style[gap]" value="<?php echo esc_attr($s['gap']); ?>" min="0" max="20" class="small-text gt-range-field" data-var="gap" /></td>
+                        </tr>
+                    </table>
+
+                    <h2>Extras</h2>
+                    <table class="form-table">
+                        <tr>
+                            <th>Box Shadow</th>
+                            <td>
+                                <label>
+                                    <input type="checkbox" name="gt_switcher_style[shadow]" value="1" <?php checked($s['shadow'], '1'); ?> class="gt-check-field" data-var="shadow" />
+                                    Enable drop shadow
+                                </label>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th>Label Format</th>
+                            <td>
+                                <select name="gt_switcher_style[label_format]" class="gt-select-field" data-var="labelFormat">
+                                    <option value="name" <?php selected($s['label_format'], 'name'); ?>>Full Name (English)</option>
+                                    <option value="code" <?php selected($s['label_format'], 'code'); ?>>Code (EN)</option>
+                                    <option value="both" <?php selected($s['label_format'], 'both'); ?>>Both (EN - English)</option>
+                                </select>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th>Fixed Position</th>
+                            <td>
+                                <select name="gt_switcher_style[position]" class="gt-select-field" data-var="position">
+                                    <option value="none" <?php selected($s['position'], 'none'); ?>>None (inline)</option>
+                                    <option value="bottom-right" <?php selected($s['position'], 'bottom-right'); ?>>Bottom Right</option>
+                                    <option value="bottom-left" <?php selected($s['position'], 'bottom-left'); ?>>Bottom Left</option>
+                                    <option value="top-right" <?php selected($s['position'], 'top-right'); ?>>Top Right</option>
+                                    <option value="top-left" <?php selected($s['position'], 'top-left'); ?>>Top Left</option>
+                                </select>
+                                <p class="description">Fix the switcher to a corner of the viewport.</p>
+                            </td>
+                        </tr>
+                    </table>
+
+                    <?php submit_button('Save Switcher Style'); ?>
+                </form>
+            </div>
+
+            <!-- Live Preview -->
+            <div style="flex: 0 0 340px; position: sticky; top: 40px;">
+                <div class="card" style="padding: 24px;">
+                    <h2 style="margin-top: 0;">Preview</h2>
+
+                    <h3 style="margin-bottom: 8px; color: #666; font-size: 12px; text-transform: uppercase;">Buttons Style</h3>
+                    <div id="gt-preview-buttons" style="display: inline-flex; margin-bottom: 24px;">
+                        <a href="#" class="gt-preview-btn gt-prev-label-source" id="gt-prev-btn-source" onclick="return false;"><?php echo esc_html($source_label); ?></a>
+                        <a href="#" class="gt-preview-btn gt-preview-active gt-prev-label-target" id="gt-prev-btn-target" onclick="return false;"><?php echo esc_html($target_label); ?></a>
+                    </div>
+
+                    <h3 style="margin-bottom: 8px; color: #666; font-size: 12px; text-transform: uppercase;">Dropdown Style</h3>
+                    <div id="gt-preview-dropdown">
+                        <select class="gt-preview-select" id="gt-prev-select">
+                            <option class="gt-prev-label-source"><?php echo esc_html($source_label); ?></option>
+                            <option selected class="gt-prev-label-target"><?php echo esc_html($target_label); ?></option>
+                        </select>
+                    </div>
+
+                    <p class="description" style="margin-top: 20px;">
+                        Use <code>[gt_language_switcher]</code> for dropdown or <code>[gt_language_switcher style="buttons"]</code> for buttons.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        #gt-preview-buttons {
+            gap: <?php echo intval($s['gap']); ?>px;
+            border-radius: <?php echo intval($s['border_radius']); ?>px;
+            overflow: hidden;
+            border: 1px solid <?php echo esc_attr($s['border_color']); ?>;
+            <?php if ($s['shadow'] === '1'): ?>
+            box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+            <?php endif; ?>
+        }
+        .gt-preview-btn {
+            display: inline-block;
+            padding: <?php echo intval($s['padding_v']); ?>px <?php echo intval($s['padding_h']); ?>px;
+            font-size: <?php echo intval($s['font_size']); ?>px;
+            background: <?php echo esc_attr($s['bg_color']); ?>;
+            color: <?php echo esc_attr($s['text_color']); ?>;
+            text-decoration: none;
+            cursor: pointer;
+            transition: all 0.15s;
+            line-height: 1.4;
+        }
+        .gt-preview-btn:hover {
+            background: <?php echo esc_attr($s['hover_bg_color']); ?>;
+            color: <?php echo esc_attr($s['hover_text_color']); ?>;
+        }
+        .gt-preview-btn.gt-preview-active {
+            background: <?php echo esc_attr($s['active_bg_color']); ?>;
+            color: <?php echo esc_attr($s['active_text_color']); ?>;
+        }
+        .gt-preview-select {
+            padding: <?php echo intval($s['padding_v']); ?>px <?php echo intval($s['padding_h']); ?>px;
+            font-size: <?php echo intval($s['font_size']); ?>px;
+            background: <?php echo esc_attr($s['bg_color']); ?>;
+            color: <?php echo esc_attr($s['text_color']); ?>;
+            border: 1px solid <?php echo esc_attr($s['border_color']); ?>;
+            border-radius: <?php echo intval($s['border_radius']); ?>px;
+            <?php if ($s['shadow'] === '1'): ?>
+            box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+            <?php endif; ?>
+            cursor: pointer;
+            min-width: 140px;
+        }
+    </style>
+
+    <script>
+    jQuery(document).ready(function($) {
+        // Language data for label format preview
+        var gtLangs = {
+            source: { code: '<?php echo esc_js(strtoupper($source_lang)); ?>', name: '<?php echo esc_js($source_name); ?>' },
+            target: { code: '<?php echo esc_js(strtoupper($target_lang ?: 'XX')); ?>', name: '<?php echo esc_js($target_name); ?>' }
+        };
+
+        // Init color pickers with live update
+        $('.gt-color-field').wpColorPicker({
+            change: function(event, ui) {
+                setTimeout(updatePreview, 50);
+            },
+            clear: function() {
+                setTimeout(updatePreview, 50);
+            }
+        });
+
+        // Live update on number/checkbox/select change
+        $('.gt-range-field, .gt-check-field, .gt-select-field').on('input change', function() {
+            updatePreview();
+        });
+
+        function getVal(name) {
+            var $el = $('[data-var="' + name + '"]');
+            if ($el.is(':checkbox')) return $el.is(':checked');
+            if ($el.hasClass('gt-color-field')) return $el.wpColorPicker('color') || $el.val();
+            return $el.val();
+        }
+
+        function formatLabel(lang, format) {
+            if (format === 'code') return lang.code;
+            if (format === 'both') return lang.code + ' - ' + lang.name;
+            return lang.name;
+        }
+
+        function updatePreview() {
+            var bg = getVal('bgColor');
+            var text = getVal('textColor');
+            var activeBg = getVal('activeBgColor');
+            var activeText = getVal('activeTextColor');
+            var hoverBg = getVal('hoverBgColor');
+            var hoverText = getVal('hoverTextColor');
+            var border = getVal('borderColor');
+            var radius = parseInt(getVal('borderRadius')) || 0;
+            var size = parseInt(getVal('fontSize')) || 14;
+            var padH = parseInt(getVal('paddingH')) || 0;
+            var padV = parseInt(getVal('paddingV')) || 0;
+            var gap = parseInt(getVal('gap')) || 0;
+            var shadow = getVal('shadow');
+
+            var boxShadow = shadow ? '0 2px 8px rgba(0,0,0,0.12)' : 'none';
+
+            // Buttons container
+            $('#gt-preview-buttons').css({
+                gap: gap + 'px',
+                borderRadius: radius + 'px',
+                borderColor: border,
+                boxShadow: boxShadow
+            });
+
+            // Inactive button
+            $('#gt-prev-btn-source').css({
+                padding: padV + 'px ' + padH + 'px',
+                fontSize: size + 'px',
+                background: bg,
+                color: text
+            });
+
+            // Active button
+            $('#gt-prev-btn-target').css({
+                padding: padV + 'px ' + padH + 'px',
+                fontSize: size + 'px',
+                background: activeBg,
+                color: activeText
+            });
+
+            // Dropdown
+            $('#gt-prev-select').css({
+                padding: padV + 'px ' + padH + 'px',
+                fontSize: size + 'px',
+                background: bg,
+                color: text,
+                borderColor: border,
+                borderRadius: radius + 'px',
+                boxShadow: boxShadow
+            });
+
+            // Update labels
+            var fmt = getVal('labelFormat');
+            var srcLabel = formatLabel(gtLangs.source, fmt);
+            var tgtLabel = formatLabel(gtLangs.target, fmt);
+            $('.gt-prev-label-source').text(srcLabel);
+            $('.gt-prev-label-target').text(tgtLabel);
+
+            // Update hover styles dynamically
+            var styleTag = $('#gt-dynamic-hover');
+            if (!styleTag.length) {
+                styleTag = $('<style id="gt-dynamic-hover"></style>').appendTo('head');
+            }
+            styleTag.html(
+                '.gt-preview-btn:not(.gt-preview-active):hover{background:' + hoverBg + '!important;color:' + hoverText + '!important;}'
+            );
+        }
+    });
+    </script>
+    <?php
+}
+
+// ============================================
+// FRONTEND FUNCTIONS
+// ============================================
+
+// Detect language prefix from the current URL
+function gt_get_language_from_url() {
+    $request_uri = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '';
+    $target_lang = get_option('gt_target_language');
+
+    if (!empty($target_lang) && preg_match('#^/' . preg_quote($target_lang, '#') . '(/|$)#', $request_uri)) {
+        return $target_lang;
+    }
+
+    return '';
+}
+
+// Get current language from URL prefix, then cookie, then default
+function gt_get_current_language() {
+    $from_url = gt_get_language_from_url();
+    if (!empty($from_url)) {
+        return $from_url;
+    }
+
+    if (isset($_COOKIE['gt_language'])) {
+        return sanitize_text_field($_COOKIE['gt_language']);
+    }
+
+    return gt_get_source_language();
+}
+
+// Check if we should show translations
+function gt_should_translate() {
+    $current = gt_get_current_language();
+    $target = get_option('gt_target_language');
+    return ($current === $target);
+}
+
+// Add rewrite rules for /{lang}/ prefix
+function gt_add_rewrite_rules() {
+    $target_lang = get_option('gt_target_language');
+    if (empty($target_lang)) {
+        return;
+    }
+
+    add_rewrite_rule(
+        '^' . $target_lang . '/?$',
+        'index.php?gt_lang=' . $target_lang,
+        'top'
+    );
+    add_rewrite_rule(
+        '^' . $target_lang . '/(.+?)/?$',
+        'index.php?gt_lang=' . $target_lang . '&gt_original_path=$matches[1]',
+        'top'
+    );
+}
+add_action('init', 'gt_add_rewrite_rules');
+
+// Register query vars
+function gt_query_vars($vars) {
+    $vars[] = 'gt_lang';
+    $vars[] = 'gt_original_path';
+    return $vars;
+}
+add_filter('query_vars', 'gt_query_vars');
+
+// Resolve the original path when language prefix is present
+function gt_parse_request($wp) {
+    if (!empty($wp->query_vars['gt_lang'])) {
+        $original_path = isset($wp->query_vars['gt_original_path']) ? $wp->query_vars['gt_original_path'] : '';
+
+        if (empty($original_path)) {
+            // Home page in translated language
+            $wp->query_vars = ['gt_lang' => $wp->query_vars['gt_lang']];
+            return;
+        }
+
+        // Re-parse the original path to find the actual post/page/product
+        $url = home_url('/' . $original_path . '/');
+        $post_id = url_to_postid($url);
+
+        if ($post_id) {
+            $post = get_post($post_id);
+            if ($post) {
+                unset($wp->query_vars['gt_original_path']);
+                if ($post->post_type === 'product') {
+                    $wp->query_vars['product'] = $post->post_name;
+                    $wp->query_vars['post_type'] = 'product';
+                    $wp->query_vars['name'] = $post->post_name;
+                } elseif ($post->post_type === 'page') {
+                    $wp->query_vars['pagename'] = $post->post_name;
+                } else {
+                    $wp->query_vars['name'] = $post->post_name;
+                }
+                return;
+            }
+        }
+
+        // Try as a product category
+        $term = get_term_by('slug', basename($original_path), 'product_cat');
+        if ($term) {
+            unset($wp->query_vars['gt_original_path']);
+            $wp->query_vars['product_cat'] = $term->slug;
+            return;
+        }
+
+        // Try as a regular category
+        $term = get_term_by('slug', basename($original_path), 'category');
+        if ($term) {
+            unset($wp->query_vars['gt_original_path']);
+            $wp->query_vars['category_name'] = $term->slug;
+            return;
+        }
+    }
+}
+add_action('parse_request', 'gt_parse_request');
+
+// Sync the language cookie with the URL prefix
+function gt_sync_language_cookie() {
+    if (is_admin()) {
+        return;
+    }
+
+    $lang_from_url = gt_get_language_from_url();
+    $source_lang = gt_get_source_language();
+
+    if (!empty($lang_from_url)) {
+        // Visiting /{lang}/ — set cookie to target language
+        if (!isset($_COOKIE['gt_language']) || $_COOKIE['gt_language'] !== $lang_from_url) {
+            setcookie('gt_language', $lang_from_url, time() + YEAR_IN_SECONDS, '/');
+            $_COOKIE['gt_language'] = $lang_from_url;
+        }
+    } else {
+        // Visiting non-prefixed URL — reset cookie to source language
+        if (isset($_COOKIE['gt_language']) && $_COOKIE['gt_language'] !== $source_lang) {
+            setcookie('gt_language', $source_lang, time() + YEAR_IN_SECONDS, '/');
+            $_COOKIE['gt_language'] = $source_lang;
+        }
+    }
+}
+add_action('init', 'gt_sync_language_cookie', 1);
+
+// Prefix permalinks with /{lang}/ when in translated mode
+function gt_prefix_permalink($url, $post = null) {
+    if (is_admin()) {
+        return $url;
+    }
+
+    if (!gt_should_translate()) {
+        return $url;
+    }
+
+    $target_lang = get_option('gt_target_language');
+    $home_url = home_url('/');
+    $prefix = home_url('/' . $target_lang . '/');
+
+    // Avoid double-prefixing
+    if (strpos($url, $prefix) === 0) {
+        return $url;
+    }
+
+    // Only prefix URLs from this site
+    if (strpos($url, $home_url) === 0) {
+        $relative = substr($url, strlen($home_url));
+        return $prefix . $relative;
+    }
+
+    return $url;
+}
+add_filter('post_link', 'gt_prefix_permalink', 10, 2);
+add_filter('page_link', 'gt_prefix_permalink', 10, 2);
+add_filter('post_type_link', 'gt_prefix_permalink', 10, 2);
+add_filter('term_link', 'gt_prefix_permalink', 10, 1);
+add_filter('woocommerce_product_get_permalink', 'gt_prefix_permalink', 10, 1);
+
+// Prefix the home URL on frontend when translated
+function gt_prefix_home_url($url, $path) {
+    if (is_admin() || !gt_should_translate()) {
+        return $url;
+    }
+
+    $target_lang = get_option('gt_target_language');
+
+    // Avoid double-prefixing and only affect root/empty paths
+    if (!empty($path) && $path !== '/') {
+        return $url;
+    }
+
+    return rtrim($url, '/') . '/' . $target_lang . '/';
+}
+add_filter('home_url', 'gt_prefix_home_url', 10, 2);
+
+// Flush rewrite rules when target language setting is updated
+function gt_flush_on_language_change($old_value, $new_value) {
+    if ($old_value !== $new_value) {
+        flush_rewrite_rules();
+    }
+}
+add_action('update_option_gt_target_language', 'gt_flush_on_language_change', 10, 2);
+
+// Also flush on activation
+function gt_flush_rewrite_rules() {
+    gt_add_rewrite_rules();
+    flush_rewrite_rules();
+}
+register_activation_hook(__FILE__, 'gt_flush_rewrite_rules');
+register_deactivation_hook(__FILE__, 'flush_rewrite_rules');
+
+// Get translation for a string
+function gt_get_translation($original_string) {
+    if (!gt_should_translate()) {
+        return $original_string;
+    }
+    
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'gt_translations';
+    $target_lang = get_option('gt_target_language');
+    $string_hash = md5($original_string);
+    
+    $translation = $wpdb->get_var($wpdb->prepare(
+        "SELECT translated_string FROM $table_name 
+        WHERE string_hash = %s AND language_code = %s AND status IN ('translated', 'edited')",
+        $string_hash,
+        $target_lang
+    ));
+    
+    return $translation ? $translation : $original_string;
+}
+
+// Output frontend switcher CSS
+function gt_frontend_switcher_css() {
+    $s = gt_get_switcher_style();
+    $shadow = $s['shadow'] === '1' ? '0 2px 8px rgba(0,0,0,0.12)' : 'none';
+    $radius = intval($s['border_radius']);
+    $padV = intval($s['padding_v']);
+    $padH = intval($s['padding_h']);
+    $fontSize = intval($s['font_size']);
+    $gap = intval($s['gap']);
+    ?>
+    <style id="gt-switcher-css">
+    .gt-language-switcher.gt-buttons {
+        display: inline-flex;
+        gap: <?php echo $gap; ?>px;
+        border: 1px solid <?php echo esc_attr($s['border_color']); ?>;
+        border-radius: <?php echo $radius; ?>px;
+        overflow: hidden;
+        box-shadow: <?php echo $shadow; ?>;
+    }
+    .gt-language-switcher.gt-buttons .gt-lang-btn {
+        display: inline-block;
+        padding: <?php echo $padV; ?>px <?php echo $padH; ?>px;
+        font-size: <?php echo $fontSize; ?>px;
+        line-height: 1.4;
+        background: <?php echo esc_attr($s['bg_color']); ?>;
+        color: <?php echo esc_attr($s['text_color']); ?>;
+        text-decoration: none;
+        cursor: pointer;
+        transition: background 0.15s, color 0.15s;
+    }
+    .gt-language-switcher.gt-buttons .gt-lang-btn:hover {
+        background: <?php echo esc_attr($s['hover_bg_color']); ?>;
+        color: <?php echo esc_attr($s['hover_text_color']); ?>;
+    }
+    .gt-language-switcher.gt-buttons .gt-lang-btn.active {
+        background: <?php echo esc_attr($s['active_bg_color']); ?>;
+        color: <?php echo esc_attr($s['active_text_color']); ?>;
+    }
+    .gt-language-switcher.gt-dropdown select {
+        padding: <?php echo $padV; ?>px <?php echo $padH; ?>px;
+        font-size: <?php echo $fontSize; ?>px;
+        background: <?php echo esc_attr($s['bg_color']); ?>;
+        color: <?php echo esc_attr($s['text_color']); ?>;
+        border: 1px solid <?php echo esc_attr($s['border_color']); ?>;
+        border-radius: <?php echo $radius; ?>px;
+        box-shadow: <?php echo $shadow; ?>;
+        cursor: pointer;
+        min-width: 140px;
+        -webkit-appearance: none;
+        appearance: none;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='<?php echo urlencode($s['text_color']); ?>' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right <?php echo $padH; ?>px center;
+        padding-right: <?php echo $padH + 16; ?>px;
+    }
+    .gt-language-switcher.gt-dropdown select:hover {
+        border-color: <?php echo esc_attr($s['hover_bg_color']); ?>;
+    }
+    <?php if ($s['position'] !== 'none'):
+        $pos = explode('-', $s['position']);
+        $vertical = $pos[0]; // top or bottom
+        $horizontal = $pos[1]; // left or right
+    ?>
+    .gt-switcher-fixed {
+        position: fixed;
+        <?php echo $vertical; ?>: 20px;
+        <?php echo $horizontal; ?>: 20px;
+        z-index: 99999;
+    }
+    <?php endif; ?>
+    </style>
+    <?php
+}
+add_action('wp_head', 'gt_frontend_switcher_css');
+
+// Language switcher shortcode [gt_language_switcher]
+function gt_language_switcher_shortcode($atts) {
+    $atts = shortcode_atts([
+        'style' => 'dropdown', // dropdown, buttons
+    ], $atts);
+
+    $current_lang = gt_get_current_language();
+    $source_lang = gt_get_source_language();
+    $target_lang = get_option('gt_target_language');
+    $languages = gt_get_available_languages();
+    $s = gt_get_switcher_style();
+
+    if (empty($target_lang)) {
+        return '<!-- GT: No target language configured -->';
+    }
+
+    ob_start();
+
+    $current_path = trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
+    // Strip existing language prefix if present
+    if (strpos($current_path, $target_lang . '/') === 0 || $current_path === $target_lang) {
+        $current_path = substr($current_path, strlen($target_lang) + 1);
+    }
+    $source_url = home_url('/' . $current_path);
+    $target_url = home_url('/' . $target_lang . '/' . $current_path);
+
+    $fixed_class = ($s['position'] !== 'none') ? ' gt-switcher-fixed' : '';
+    $fmt = $s['label_format'];
+    $source_label = gt_format_lang_label($source_lang, $languages[$source_lang], $fmt);
+    $target_label = gt_format_lang_label($target_lang, $languages[$target_lang], $fmt);
+
+    if ($atts['style'] === 'buttons'): ?>
+        <div class="gt-language-switcher gt-buttons<?php echo $fixed_class; ?>">
+            <a href="<?php echo esc_url($source_url); ?>" class="gt-lang-btn <?php echo $current_lang === $source_lang ? 'active' : ''; ?>">
+                <?php echo esc_html($source_label); ?>
+            </a>
+            <a href="<?php echo esc_url($target_url); ?>" class="gt-lang-btn <?php echo $current_lang === $target_lang ? 'active' : ''; ?>">
+                <?php echo esc_html($target_label); ?>
+            </a>
+        </div>
+    <?php else: ?>
+        <div class="gt-language-switcher gt-dropdown<?php echo $fixed_class; ?>">
+            <select onchange="window.location.href=this.value">
+                <option value="<?php echo esc_url($source_url); ?>" <?php selected($current_lang, $source_lang); ?>>
+                    <?php echo esc_html($source_label); ?>
+                </option>
+                <option value="<?php echo esc_url($target_url); ?>" <?php selected($current_lang, $target_lang); ?>>
+                    <?php echo esc_html($target_label); ?>
+                </option>
+            </select>
+        </div>
+    <?php endif; ?>
+    <?php
+
+    return ob_get_clean();
+}
+add_shortcode('gt_language_switcher', 'gt_language_switcher_shortcode');
+
+// Filter WooCommerce product title
+function gt_translate_product_title($title, $id) {
+    if (get_post_type($id) === 'product') {
+        return gt_get_translation($title);
+    }
+    return $title;
+}
+add_filter('the_title', 'gt_translate_product_title', 10, 2);
+
+// Filter WooCommerce product content
+function gt_translate_product_content($content) {
+    if (is_product() || is_shop() || is_product_category()) {
+        return gt_get_translation($content);
+    }
+    return $content;
+}
+add_filter('the_content', 'gt_translate_product_content', 10, 1);
+
+// Filter WooCommerce product short description
+function gt_translate_product_excerpt($excerpt) {
+    if (is_product() || is_shop() || is_product_category()) {
+        return gt_get_translation($excerpt);
+    }
+    return $excerpt;
+}
+add_filter('the_excerpt', 'gt_translate_product_excerpt', 10, 1);
+add_filter('woocommerce_short_description', 'gt_translate_product_excerpt', 10, 1);
+
+// Get cached Elementor translations
+function gt_get_elementor_translations() {
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'gt_translations';
+    $target_lang = get_option('gt_target_language');
+
+    $cached = $wpdb->get_results($wpdb->prepare(
+        "SELECT original_string, translated_string FROM $table_name
+        WHERE source_type = 'elementor' AND status IN ('translated', 'edited') AND language_code = %s",
+        $target_lang
+    ));
+
+    return $cached;
+}
+
+// Apply Elementor translations to content string
+function gt_apply_elementor_translations($content) {
+    $translations = gt_get_elementor_translations();
+    foreach ($translations as $t) {
+        if (!empty($t->translated_string) && !empty($t->original_string)) {
+            $content = str_replace($t->original_string, $t->translated_string, $content);
+        }
+    }
+    return $content;
+}
+
+// Filter Elementor widget content
+function gt_translate_elementor_widget($content, $widget) {
+    if (!gt_should_translate()) {
+        return $content;
+    }
+    return gt_apply_elementor_translations($content);
+}
+add_filter('elementor/widget/render_content', 'gt_translate_elementor_widget', 10, 2);
+
+// Also filter the_content for Elementor pages
+function gt_translate_page_content($content) {
+    if (!gt_should_translate()) {
+        return $content;
+    }
+
+    // Skip product pages — already handled by gt_translate_product_content
+    if (is_product() || is_shop() || is_product_category()) {
+        return $content;
+    }
+
+    // Check if this is an Elementor page
+    if (defined('ELEMENTOR_VERSION') && \Elementor\Plugin::$instance->documents->get(get_the_ID())) {
+        $content = gt_apply_elementor_translations($content);
+    }
+    
+    return $content;
+}
+add_filter('the_content', 'gt_translate_page_content', 999, 1);
