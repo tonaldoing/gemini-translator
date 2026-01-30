@@ -1,11 +1,11 @@
 <?php
 /**
  * Plugin Name: Gemini Translator
- * Plugin URI: https://github.com/tu-usuario/gemini-translator
+ * Plugin URI: https://github.com/tonaldoing/gemini-translator
  * Description: Translate your WooCommerce store using Google Gemini AI
  * Version: 0.1.0
- * Author: Tu Nombre
- * Author URI: https://tu-sitio.com
+ * Author: Tomás Vilas for Amrak Solutions
+ * Author URI: https://github.com/tonaldoing
  * License: GPL v2 or later
  * Text Domain: gemini-translator
  */
@@ -16,9 +16,9 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('GT_VERSION', '0.1.0');
-define('GT_PLUGIN_DIR', plugin_dir_path(__FILE__));
-define('GT_PLUGIN_URL', plugin_dir_url(__FILE__));
+define('GEMINI_TRANSLATOR_VERSION', '0.1.0');
+define('GEMINI_TRANSLATOR_PLUGIN_DIR', plugin_dir_path(__FILE__));
+define('GEMINI_TRANSLATOR_PLUGIN_URL', plugin_dir_url(__FILE__));
 
 // Create database table on activation
 function gt_activate() {
@@ -30,7 +30,7 @@ function gt_activate() {
     $sql = "CREATE TABLE $table_name (
         id bigint(20) NOT NULL AUTO_INCREMENT,
         original_string text NOT NULL,
-        string_hash varchar(32) NOT NULL,
+        string_hash varchar(64) NOT NULL,
         translated_string text,
         language_code varchar(10) NOT NULL,
         context varchar(100),
@@ -42,13 +42,15 @@ function gt_activate() {
         PRIMARY KEY (id),
         KEY string_hash (string_hash),
         KEY language_code (language_code),
-        KEY status (status)
+        KEY status (status),
+        KEY source_type (source_type),
+        KEY source_id (source_id)
     ) $charset_collate;";
     
     require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
     dbDelta($sql);
     
-    add_option('gt_db_version', GT_VERSION);
+    add_option('gt_db_version', GEMINI_TRANSLATOR_VERSION);
 }
 register_activation_hook(__FILE__, 'gt_activate');
 
@@ -104,9 +106,15 @@ add_action('admin_menu', 'gt_admin_menu');
 
 // Register settings
 function gt_register_settings() {
-    register_setting('gt_settings', 'gt_api_key');
-    register_setting('gt_settings', 'gt_source_language');
-    register_setting('gt_settings', 'gt_target_language');
+    register_setting('gt_settings', 'gt_api_key', [
+        'sanitize_callback' => 'sanitize_text_field',
+    ]);
+    register_setting('gt_settings', 'gt_source_language', [
+        'sanitize_callback' => 'sanitize_text_field',
+    ]);
+    register_setting('gt_settings', 'gt_target_language', [
+        'sanitize_callback' => 'sanitize_text_field',
+    ]);
 
     // Switcher style settings
     register_setting('gt_switcher_settings', 'gt_switcher_style', [
@@ -126,6 +134,7 @@ function gt_get_default_switcher_style() {
         'hover_bg_color'    => '#f0f0f0',
         'hover_text_color'  => '#0073aa',
         'border_color'      => '#dddddd',
+        'border_width'      => '1',
         'border_radius'     => '6',
         'font_size'         => '14',
         'padding_h'         => '16',
@@ -134,6 +143,7 @@ function gt_get_default_switcher_style() {
         'position'          => 'none',       // none, bottom-right, bottom-left, top-right, top-left
         'shadow'            => '1',
         'label_format'      => 'name',      // name, code, both
+        'font_family'       => 'inherit',
     ];
 }
 
@@ -149,7 +159,7 @@ function gt_sanitize_switcher_style($input) {
         }
     }
 
-    $number_fields = ['border_radius', 'font_size', 'padding_h', 'padding_v', 'gap'];
+    $number_fields = ['border_width', 'border_radius', 'font_size', 'padding_h', 'padding_v', 'gap'];
     foreach ($number_fields as $field) {
         $clean[$field] = isset($input[$field]) ? max(0, intval($input[$field])) : $defaults[$field];
     }
@@ -162,6 +172,9 @@ function gt_sanitize_switcher_style($input) {
     $allowed_formats = ['name', 'code', 'both'];
     $clean['label_format'] = isset($input['label_format']) && in_array($input['label_format'], $allowed_formats) ? $input['label_format'] : $defaults['label_format'];
 
+    $allowed_fonts = array_merge(['inherit'], array_keys(gt_get_available_fonts()));
+    $clean['font_family'] = isset($input['font_family']) && in_array($input['font_family'], $allowed_fonts) ? $input['font_family'] : $defaults['font_family'];
+
     return $clean;
 }
 
@@ -171,6 +184,65 @@ function gt_get_switcher_style() {
         return gt_get_default_switcher_style();
     }
     return array_merge(gt_get_default_switcher_style(), $style);
+}
+
+function gt_get_available_fonts() {
+    $fonts = [
+        'Arial, Helvetica, sans-serif'          => 'Arial',
+        'Verdana, Geneva, sans-serif'            => 'Verdana',
+        'Tahoma, Geneva, sans-serif'             => 'Tahoma',
+        'Georgia, serif'                         => 'Georgia',
+        '"Times New Roman", Times, serif'        => 'Times New Roman',
+        '"Courier New", Courier, monospace'      => 'Courier New',
+        'system-ui, -apple-system, sans-serif'   => 'System UI',
+    ];
+
+    // Detect Elementor global fonts
+    $elementor_kit_id = get_option('elementor_active_kit');
+    if ($elementor_kit_id) {
+        $kit_settings = get_post_meta($elementor_kit_id, '_elementor_page_settings', true);
+        if (is_array($kit_settings) && !empty($kit_settings['system_typography'])) {
+            foreach ($kit_settings['system_typography'] as $typo) {
+                if (!empty($typo['typography_font_family'])) {
+                    $family = $typo['typography_font_family'];
+                    $key = '"' . $family . '", sans-serif';
+                    $label = $typo['title'] ?? $family;
+                    $fonts[$key] = $label . ' (Elementor)';
+                }
+            }
+        }
+        if (is_array($kit_settings) && !empty($kit_settings['custom_typography'])) {
+            foreach ($kit_settings['custom_typography'] as $typo) {
+                if (!empty($typo['typography_font_family'])) {
+                    $family = $typo['typography_font_family'];
+                    $key = '"' . $family . '", sans-serif';
+                    $label = $typo['title'] ?? $family;
+                    $fonts[$key] = $label . ' (Elementor)';
+                }
+            }
+        }
+    }
+
+    // Detect Google Fonts enqueued by theme
+    global $wp_styles;
+    if ($wp_styles) {
+        foreach ($wp_styles->registered as $handle => $style) {
+            if (isset($style->src) && strpos($style->src, 'fonts.googleapis.com') !== false) {
+                if (preg_match_all('/family=([^&:;]+)/', $style->src, $matches)) {
+                    foreach ($matches[1] as $gfont) {
+                        $gfont = urldecode($gfont);
+                        $gfont = str_replace('+', ' ', $gfont);
+                        $key = '"' . $gfont . '", sans-serif';
+                        if (!isset($fonts[$key])) {
+                            $fonts[$key] = $gfont . ' (Google)';
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return $fonts;
 }
 
 function gt_format_lang_label($lang_code, $lang_name, $format) {
@@ -223,16 +295,20 @@ function gt_get_available_languages() {
 function gt_scan_products() {
     $language = get_option('gt_target_language');
     $scanned = 0;
-    $page = 1;
+    $offset = 0;
     $batch_size = 50;
 
     do {
-        $products = get_posts([
-            'post_type' => 'product',
-            'post_status' => 'publish',
-            'numberposts' => $batch_size,
-            'paged' => $page,
+        $query = new WP_Query([
+            'post_type'      => 'product',
+            'post_status'    => 'publish',
+            'posts_per_page' => $batch_size,
+            'offset'         => $offset,
+            'fields'         => 'all',
+            'no_found_rows'  => true,
         ]);
+
+        $products = $query->posts;
 
         foreach ($products as $product) {
             if (!empty($product->post_title)) {
@@ -251,7 +327,7 @@ function gt_scan_products() {
             }
         }
 
-        $page++;
+        $offset += $batch_size;
     } while (count($products) === $batch_size);
 
     return $scanned;
@@ -452,8 +528,8 @@ function gt_insert_string($string, $context, $source_type, $source_id, $language
     }
     
     $table_name = $wpdb->prefix . 'gt_translations';
-    $string_hash = md5($string);
-    
+    $string_hash = hash('sha256', $string);
+
     // Check if already exists (any source, same string)
     $exists = $wpdb->get_var($wpdb->prepare(
         "SELECT id FROM $table_name WHERE string_hash = %s AND language_code = %s",
@@ -485,36 +561,45 @@ function gt_clear_elementor_strings() {
     return $wpdb->delete($table_name, ['source_type' => 'elementor']);
 }
 
-// Clear orphaned strings (from deleted pages/products)
+// Clear orphaned strings (from deleted/trashed pages/products)
 function gt_clear_orphaned_strings() {
     global $wpdb;
     $table_name = $wpdb->prefix . 'gt_translations';
-    
-    // Get all source_ids from translations
-    $source_ids = $wpdb->get_col("SELECT DISTINCT source_id FROM $table_name WHERE source_id IS NOT NULL");
-    
+
+    // Remove strings where post is deleted entirely OR in trash
+    $orphans = $wpdb->get_results(
+        "SELECT t.source_id, COUNT(*) as cnt
+        FROM $table_name t
+        LEFT JOIN {$wpdb->posts} p ON t.source_id = p.ID
+        WHERE t.source_id IS NOT NULL
+          AND (p.ID IS NULL OR p.post_status IN ('trash', 'auto-draft'))
+        GROUP BY t.source_id"
+    );
+
     $deleted_pages = 0;
     $deleted_strings = 0;
-    
-    foreach ($source_ids as $source_id) {
-        // Check if post exists
-        $post_exists = get_post_status($source_id);
-        
-        if ($post_exists === false) {
-            // Count strings to delete
-            $count = $wpdb->get_var($wpdb->prepare(
-                "SELECT COUNT(*) FROM $table_name WHERE source_id = %d",
-                $source_id
-            ));
-            
-            // Post doesn't exist, delete translations
-            $wpdb->delete($table_name, ['source_id' => $source_id]);
-            $deleted_pages++;
-            $deleted_strings += $count;
-        }
+
+    foreach ($orphans as $orphan) {
+        $wpdb->delete($table_name, ['source_id' => $orphan->source_id]);
+        $deleted_pages++;
+        $deleted_strings += (int) $orphan->cnt;
     }
-    
+
     return ['pages' => $deleted_pages, 'strings' => $deleted_strings];
+}
+
+// Count orphaned strings (deleted or trashed posts) without removing them
+function gt_count_orphaned_strings() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'gt_translations';
+
+    return (int) $wpdb->get_var(
+        "SELECT COUNT(*)
+        FROM $table_name t
+        LEFT JOIN {$wpdb->posts} p ON t.source_id = p.ID
+        WHERE t.source_id IS NOT NULL
+          AND (p.ID IS NULL OR p.post_status IN ('trash', 'auto-draft'))"
+    );
 }
 
 // Test API connection
@@ -702,7 +787,7 @@ function gt_admin_scripts($hook) {
     if (strpos($hook, 'gemini-translator') === false) {
         return;
     }
-    wp_enqueue_script('gt-admin', GT_PLUGIN_URL . 'admin.js', ['jquery'], GT_VERSION, true);
+    wp_enqueue_script('gt-admin', GEMINI_TRANSLATOR_PLUGIN_URL . 'admin.js', ['jquery'], GEMINI_TRANSLATOR_VERSION, true);
     wp_localize_script('gt-admin', 'gt_ajax', [
         'url' => admin_url('admin-ajax.php'),
         'nonce' => wp_create_nonce('gt_ajax_translate'),
@@ -712,37 +797,40 @@ add_action('admin_enqueue_scripts', 'gt_admin_scripts');
 
 // Handle actions
 function gt_handle_actions() {
+    if (!current_user_can('manage_options')) {
+        return;
+    }
+
     if (isset($_POST['gt_scan']) && check_admin_referer('gt_scan_action')) {
         $count = gt_scan_products();
-        add_settings_error('gt_messages', 'gt_scan_success', "Scanned $count strings from products.", 'success');
+        add_settings_error('gt_messages', 'gt_scan_success', sprintf('Scanned %d strings from products.', $count), 'success');
     }
-    
+
     if (isset($_POST['gt_test_api']) && check_admin_referer('gt_test_api_action')) {
         $result = gt_test_api_connection();
         $type = $result['success'] ? 'success' : 'error';
-        add_settings_error('gt_messages', 'gt_test_result', $result['message'], $type);
+        add_settings_error('gt_messages', 'gt_test_result', wp_kses_post($result['message']), $type);
     }
-    
+
     if (isset($_POST['gt_translate']) && check_admin_referer('gt_translate_action')) {
         $result = gt_translate_batch(20);
         if ($result['translated'] > 0) {
-            add_settings_error('gt_messages', 'gt_translate_success', "Translated {$result['translated']} strings.", 'success');
+            add_settings_error('gt_messages', 'gt_translate_success', sprintf('Translated %d strings.', $result['translated']), 'success');
         }
         if (!empty($result['errors'])) {
-            $unique_errors = array_unique($result['errors']);
+            $unique_errors = array_map('sanitize_text_field', array_unique($result['errors']));
             add_settings_error('gt_messages', 'gt_translate_errors', 'Errors: ' . implode(', ', $unique_errors), 'error');
         }
     }
-    
-    
+
     // Handle inline edit save
     if (isset($_POST['gt_save_translation']) && check_admin_referer('gt_save_translation_action')) {
         global $wpdb;
         $table_name = $wpdb->prefix . 'gt_translations';
-        
+
         $id = intval($_POST['translation_id']);
         $new_translation = wp_kses_post($_POST['translated_string']);
-        
+
         $wpdb->update(
             $table_name,
             [
@@ -751,24 +839,24 @@ function gt_handle_actions() {
             ],
             ['id' => $id]
         );
-        
+
         add_settings_error('gt_messages', 'gt_save_success', 'Translation saved!', 'success');
     }
 
     if (isset($_POST['gt_scan_elementor']) && check_admin_referer('gt_scan_elementor_action')) {
         $count = gt_scan_elementor();
-        add_settings_error('gt_messages', 'gt_scan_elementor_success', "Scanned $count strings from Elementor.", 'success');
+        add_settings_error('gt_messages', 'gt_scan_elementor_success', sprintf('Scanned %d strings from Elementor.', $count), 'success');
     }
 
     if (isset($_POST['gt_clear_elementor']) && check_admin_referer('gt_clear_elementor_action')) {
         gt_clear_elementor_strings();
-        add_settings_error('gt_messages', 'gt_clear_success', "Cleared Elementor strings. Ready to re-scan.", 'success');
+        add_settings_error('gt_messages', 'gt_clear_success', 'Cleared Elementor strings. Ready to re-scan.', 'success');
     }
 
     if (isset($_POST['gt_clear_orphaned']) && check_admin_referer('gt_clear_orphaned_action')) {
         $result = gt_clear_orphaned_strings();
-        add_settings_error('gt_messages', 'gt_clear_orphaned_success', 
-            "Cleared {$result['strings']} strings from {$result['pages']} deleted pages/products.", 'success');
+        add_settings_error('gt_messages', 'gt_clear_orphaned_success',
+            sprintf('Cleared %d strings from %d deleted pages/products.', $result['strings'], $result['pages']), 'success');
     }
 }
 add_action('admin_init', 'gt_handle_actions');
@@ -780,41 +868,47 @@ function gt_admin_page() {
     $language = get_option('gt_target_language');
     $table_name = $wpdb->prefix . 'gt_translations';
     
-    // General stats
-    $total_strings = $wpdb->get_var("SELECT COUNT(*) FROM $table_name");
-    $total_pending = $wpdb->get_var("SELECT COUNT(*) FROM $table_name WHERE status = 'pending'");
-    $total_translated = $wpdb->get_var("SELECT COUNT(*) FROM $table_name WHERE status = 'translated'");
-    $total_edited = $wpdb->get_var("SELECT COUNT(*) FROM $table_name WHERE status = 'edited'");
-    
-    // Stats by source
+    // Fetch all stats in a single query
+    $stats_rows = $wpdb->get_results(
+        "SELECT source_type, status, COUNT(*) as cnt FROM $table_name GROUP BY source_type, status"
+    );
+
+    $total_strings = 0;
+    $total_pending = 0;
+    $total_translated = 0;
+    $total_edited = 0;
+
     $sources = [
-        'product' => ['label' => 'WooCommerce', 'icon' => '🛒'],
-        'elementor' => ['label' => 'Elementor', 'icon' => '📄'],
-        'wcfm' => ['label' => 'WCFM', 'icon' => '🏪'],
+        'product'   => ['label' => 'WooCommerce', 'icon' => '&#x1f6d2;'],
+        'elementor' => ['label' => 'Elementor', 'icon' => '&#x1f4c4;'],
+        'wcfm'      => ['label' => 'WCFM', 'icon' => '&#x1f3ea;'],
     ];
-    
+
     $stats_by_source = [];
-    foreach ($sources as $source_type => $source_info) {
-        $stats_by_source[$source_type] = [
-            'label' => $source_info['label'],
-            'icon' => $source_info['icon'],
-            'total' => $wpdb->get_var($wpdb->prepare(
-                "SELECT COUNT(*) FROM $table_name WHERE source_type = %s", 
-                $source_type
-            )),
-            'pending' => $wpdb->get_var($wpdb->prepare(
-                "SELECT COUNT(*) FROM $table_name WHERE source_type = %s AND status = 'pending'", 
-                $source_type
-            )),
-            'translated' => $wpdb->get_var($wpdb->prepare(
-                "SELECT COUNT(*) FROM $table_name WHERE source_type = %s AND status = 'translated'", 
-                $source_type
-            )),
-            'edited' => $wpdb->get_var($wpdb->prepare(
-                "SELECT COUNT(*) FROM $table_name WHERE source_type = %s AND status = 'edited'", 
-                $source_type
-            )),
+    foreach ($sources as $st => $info) {
+        $stats_by_source[$st] = [
+            'label'      => $info['label'],
+            'icon'       => $info['icon'],
+            'total'      => 0,
+            'pending'    => 0,
+            'translated' => 0,
+            'edited'     => 0,
         ];
+    }
+
+    foreach ($stats_rows as $row) {
+        $cnt = (int) $row->cnt;
+        $total_strings += $cnt;
+        if ($row->status === 'pending') $total_pending += $cnt;
+        if ($row->status === 'translated') $total_translated += $cnt;
+        if ($row->status === 'edited') $total_edited += $cnt;
+
+        if (isset($stats_by_source[$row->source_type])) {
+            $stats_by_source[$row->source_type]['total'] += $cnt;
+            if (isset($stats_by_source[$row->source_type][$row->status])) {
+                $stats_by_source[$row->source_type][$row->status] += $cnt;
+            }
+        }
     }
     
     settings_errors('gt_messages');
@@ -828,26 +922,26 @@ function gt_admin_page() {
             </div>
         <?php else: ?>
             <div class="notice notice-success">
-                <p>✅ Ready to translate to <strong><?php echo strtoupper($language); ?></strong></p>
+                <p>&#x2705; Ready to translate to <strong><?php echo esc_html(strtoupper($language)); ?></strong></p>
             </div>
             
             <!-- General Stats -->
             <h2>Overview</h2>
             <div style="display: flex; gap: 20px; margin: 20px 0; flex-wrap: wrap;">
                 <div class="card" style="padding: 15px; min-width: 120px;">
-                    <h3 style="margin: 0; font-size: 32px;"><?php echo $total_strings; ?></h3>
+                    <h3 style="margin: 0; font-size: 32px;"><?php echo intval($total_strings); ?></h3>
                     <p style="margin: 5px 0 0;">Total strings</p>
                 </div>
                 <div class="card" style="padding: 15px; min-width: 120px;">
-                    <h3 style="margin: 0; font-size: 32px; color: #f0ad4e;"><?php echo $total_pending; ?></h3>
+                    <h3 style="margin: 0; font-size: 32px; color: #f0ad4e;"><?php echo intval($total_pending); ?></h3>
                     <p style="margin: 5px 0 0;">Pending</p>
                 </div>
                 <div class="card" style="padding: 15px; min-width: 120px;">
-                    <h3 style="margin: 0; font-size: 32px; color: #5cb85c;"><?php echo $total_translated; ?></h3>
+                    <h3 style="margin: 0; font-size: 32px; color: #5cb85c;"><?php echo intval($total_translated); ?></h3>
                     <p style="margin: 5px 0 0;">Translated</p>
                 </div>
                 <div class="card" style="padding: 15px; min-width: 120px;">
-                    <h3 style="margin: 0; font-size: 32px; color: #0073aa;"><?php echo $total_edited; ?></h3>
+                    <h3 style="margin: 0; font-size: 32px; color: #0073aa;"><?php echo intval($total_edited); ?></h3>
                     <p style="margin: 5px 0 0;">Edited</p>
                 </div>
             </div>
@@ -868,16 +962,16 @@ function gt_admin_page() {
                     <?php foreach ($stats_by_source as $source_type => $stats): ?>
                         <?php if ($stats['total'] > 0): ?>
                         <tr>
-                            <td><?php echo $stats['icon']; ?> <?php echo $stats['label']; ?></td>
-                            <td style="text-align: center;"><?php echo $stats['total']; ?></td>
+                            <td><?php echo wp_kses_post($stats['icon']); ?> <?php echo esc_html($stats['label']); ?></td>
+                            <td style="text-align: center;"><?php echo intval($stats['total']); ?></td>
                             <td style="text-align: center;">
-                                <span style="color: #f0ad4e; font-weight: bold;"><?php echo $stats['pending']; ?></span>
+                                <span style="color: #f0ad4e; font-weight: bold;"><?php echo intval($stats['pending']); ?></span>
                             </td>
                             <td style="text-align: center;">
-                                <span style="color: #5cb85c; font-weight: bold;"><?php echo $stats['translated']; ?></span>
+                                <span style="color: #5cb85c; font-weight: bold;"><?php echo intval($stats['translated']); ?></span>
                             </td>
                             <td style="text-align: center;">
-                                <span style="color: #0073aa; font-weight: bold;"><?php echo $stats['edited']; ?></span>
+                                <span style="color: #0073aa; font-weight: bold;"><?php echo intval($stats['edited']); ?></span>
                             </td>
                         </tr>
                         <?php endif; ?>
@@ -925,16 +1019,16 @@ function gt_admin_page() {
                     <p>Translate pending strings using Gemini AI.</p>
                     <form method="post" style="display: flex; gap: 10px; flex-wrap: wrap;">
                         <?php wp_nonce_field('gt_translate_action'); ?>
-                        <button type="submit" name="gt_translate" class="button button-secondary" <?php echo $total_pending == 0 ? 'disabled' : ''; ?>>
+                        <button type="submit" name="gt_translate" class="button button-secondary" <?php disabled($total_pending, 0); ?>>
                             Translate Batch (20)
                         </button>
                     </form>
                     <div style="margin-top: 10px;">
-                        <button type="button" id="gt-translate-all-btn" class="button button-primary" <?php echo $total_pending == 0 ? 'disabled' : ''; ?>>
-                            Translate All (<span id="gt-remaining"><?php echo $total_pending; ?></span> strings)
+                        <button type="button" id="gt-translate-all-btn" class="button button-primary" <?php disabled($total_pending, 0); ?>>
+                            Translate All (<span id="gt-remaining"><?php echo intval($total_pending); ?></span> strings)
                         </button>
                         <div id="gt-translate-progress" style="display:none; margin-top: 10px;">
-                            <progress id="gt-progress-bar" max="<?php echo $total_pending; ?>" value="0" style="width: 100%;"></progress>
+                            <progress id="gt-progress-bar" max="<?php echo intval($total_pending); ?>" value="0" style="width: 100%;"></progress>
                             <p id="gt-progress-text" class="description"></p>
                         </div>
                     </div>
@@ -964,85 +1058,139 @@ function gt_admin_page() {
     <?php
 }
 
-// Translations list page
+// Translations list page — grouped by page/product with accordion UI
 function gt_translations_page() {
     global $wpdb;
     $table_name = $wpdb->prefix . 'gt_translations';
-    
-    // Pagination
-    $per_page = 20;
-    $current_page = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
-    $offset = ($current_page - 1) * $per_page;
-    
+
+    // Handle inline orphan cleanup
+    if (isset($_POST['gt_clean_orphans_inline']) && check_admin_referer('gt_clean_orphans_inline_action')) {
+        $result = gt_clear_orphaned_strings();
+        add_settings_error('gt_messages', 'gt_orphans_cleaned',
+            sprintf('Cleaned up %d strings from %d deleted pages.', $result['strings'], $result['pages']),
+            'success'
+        );
+    }
+
+    // Check for orphaned strings
+    $orphan_count = gt_count_orphaned_strings();
+
     // Filters
     $status_filter = isset($_GET['status']) ? sanitize_text_field($_GET['status']) : '';
     $context_filter = isset($_GET['context']) ? sanitize_text_field($_GET['context']) : '';
     $source_filter = isset($_GET['source_type']) ? sanitize_text_field($_GET['source_type']) : '';
     $page_filter = isset($_GET['source_id']) ? intval($_GET['source_id']) : 0;
     $search = isset($_GET['s']) ? sanitize_text_field($_GET['s']) : '';
-    
-    // Build query
+
+    // Build WHERE clause (applied to alias "t")
     $where = "WHERE 1=1";
     if ($status_filter) {
-        $where .= $wpdb->prepare(" AND status = %s", $status_filter);
+        $where .= $wpdb->prepare(" AND t.status = %s", $status_filter);
     }
     if ($context_filter) {
-        $where .= $wpdb->prepare(" AND context = %s", $context_filter);
+        $where .= $wpdb->prepare(" AND t.context = %s", $context_filter);
     }
     if ($source_filter) {
-        $where .= $wpdb->prepare(" AND source_type = %s", $source_filter);
+        $where .= $wpdb->prepare(" AND t.source_type = %s", $source_filter);
     }
     if ($page_filter) {
-        $where .= $wpdb->prepare(" AND source_id = %d", $page_filter);
+        $where .= $wpdb->prepare(" AND t.source_id = %d", $page_filter);
     }
     if ($search) {
-        $where .= $wpdb->prepare(" AND (original_string LIKE %s OR translated_string LIKE %s)", '%' . $wpdb->esc_like($search) . '%', '%' . $wpdb->esc_like($search) . '%');
+        $where .= $wpdb->prepare(" AND (t.original_string LIKE %s OR t.translated_string LIKE %s)", '%' . $wpdb->esc_like($search) . '%', '%' . $wpdb->esc_like($search) . '%');
     }
-    
-    // Get total count
-    $total_items = $wpdb->get_var("SELECT COUNT(*) FROM $table_name $where");
-    $total_pages = ceil($total_items / $per_page);
-    
-    // Get items
-    $items = $wpdb->get_results($wpdb->prepare("SELECT * FROM $table_name $where ORDER BY source_id, id DESC LIMIT %d, %d", $offset, $per_page));
-    
-    // Get available contexts for filter
-    $contexts = $wpdb->get_col("SELECT DISTINCT context FROM $table_name ORDER BY context");
-    
-    // Get available source types for filter
-    $source_types = $wpdb->get_col("SELECT DISTINCT source_type FROM $table_name ORDER BY source_type");
-    
-    // Get pages/products with translations for filter
-    $pages_with_translations = $wpdb->get_results("
-        SELECT DISTINCT source_id, source_type 
-        FROM $table_name 
-        WHERE source_id IS NOT NULL 
-        ORDER BY source_type, source_id
-    ");
-    
-    // Build page options with titles
-    $page_options = [];
-    foreach ($pages_with_translations as $p) {
-        $title = get_the_title($p->source_id);
-        if (empty($title)) {
-            $title = "ID: {$p->source_id}";
+
+    // Only show strings belonging to published posts
+    $valid_join = "FROM $table_name t INNER JOIN {$wpdb->posts} p ON t.source_id = p.ID AND p.post_status IN ('publish', 'draft', 'private')";
+
+    // Page-level pagination
+    $pages_per_view = 10;
+    $current_page = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
+    $page_offset = ($current_page - 1) * $pages_per_view;
+
+    // Count distinct pages matching filters
+    $total_source_pages = (int) $wpdb->get_var("SELECT COUNT(DISTINCT t.source_id) $valid_join $where");
+    $total_pages = max(1, ceil($total_source_pages / $pages_per_view));
+
+    // Get the source_ids for the current page view
+    $source_ids = $wpdb->get_col($wpdb->prepare(
+        "SELECT DISTINCT t.source_id $valid_join $where ORDER BY t.source_id LIMIT %d, %d",
+        $page_offset, $pages_per_view
+    ));
+
+    // Get per-source stats (total + pending counts)
+    $groups = [];
+    if (!empty($source_ids)) {
+        $id_placeholders = implode(',', array_fill(0, count($source_ids), '%d'));
+
+        $stats_query = $wpdb->prepare(
+            "SELECT t.source_id, t.source_type, COUNT(*) as total,
+                SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) as pending
+            $valid_join $where AND t.source_id IN ($id_placeholders)
+            GROUP BY t.source_id, t.source_type
+            ORDER BY t.source_id",
+            ...$source_ids
+        );
+        $stats = $wpdb->get_results($stats_query);
+
+        foreach ($stats as $stat) {
+            $groups[$stat->source_id] = [
+                'source_type' => $stat->source_type,
+                'total' => (int) $stat->total,
+                'pending' => (int) $stat->pending,
+                'items' => [],
+            ];
         }
+
+        $items_query = $wpdb->prepare(
+            "SELECT t.* $valid_join $where AND t.source_id IN ($id_placeholders) ORDER BY t.source_id, t.id",
+            ...$source_ids
+        );
+        $items = $wpdb->get_results($items_query);
+
+        foreach ($items as $item) {
+            $groups[$item->source_id]['items'][] = $item;
+        }
+    }
+
+    // Total string count (valid posts only)
+    $total_strings = (int) $wpdb->get_var("SELECT COUNT(*) $valid_join $where");
+
+    // Get available filter options (valid posts only)
+    $contexts = $wpdb->get_col("SELECT DISTINCT t.context $valid_join ORDER BY t.context");
+    $source_types = $wpdb->get_col("SELECT DISTINCT t.source_type $valid_join ORDER BY t.source_type");
+    $all_source_pages = $wpdb->get_results("SELECT DISTINCT t.source_id, t.source_type $valid_join WHERE t.source_id IS NOT NULL ORDER BY t.source_type, t.source_id");
+    $page_options = [];
+    foreach ($all_source_pages as $p) {
+        $title = get_the_title($p->source_id);
         $page_options[$p->source_id] = [
-            'title' => $title,
+            'title' => $title ?: "Untitled (ID: {$p->source_id})",
             'type' => $p->source_type,
         ];
     }
-    
+
     settings_errors('gt_messages');
     ?>
     <div class="wrap">
         <h1>Translations</h1>
-        
+
+        <?php if ($orphan_count > 0): ?>
+            <div class="notice notice-warning" style="display: flex; align-items: center; gap: 10px; padding: 10px 15px;">
+                <p style="margin: 0; flex: 1;">
+                    <strong><?php echo intval($orphan_count); ?> strings</strong> reference deleted or trashed content.
+                </p>
+                <form method="post" style="margin: 0;">
+                    <?php wp_nonce_field('gt_clean_orphans_inline_action'); ?>
+                    <button type="submit" name="gt_clean_orphans_inline" class="button button-small">Clean Up Now</button>
+                </form>
+            </div>
+        <?php endif; ?>
+
         <!-- Filters -->
         <div class="tablenav top">
             <form method="get" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                 <input type="hidden" name="page" value="gemini-translator-list" />
-                
+
                 <select name="source_type">
                     <option value="">All sources</option>
                     <?php foreach ($source_types as $type): ?>
@@ -1051,7 +1199,7 @@ function gt_translations_page() {
                         </option>
                     <?php endforeach; ?>
                 </select>
-                
+
                 <select name="source_id">
                     <option value="">All pages/products</option>
                     <?php foreach ($page_options as $id => $info): ?>
@@ -1060,14 +1208,14 @@ function gt_translations_page() {
                         </option>
                     <?php endforeach; ?>
                 </select>
-                
+
                 <select name="status">
                     <option value="">All statuses</option>
                     <option value="pending" <?php selected($status_filter, 'pending'); ?>>Pending</option>
                     <option value="translated" <?php selected($status_filter, 'translated'); ?>>Translated</option>
                     <option value="edited" <?php selected($status_filter, 'edited'); ?>>Edited</option>
                 </select>
-                
+
                 <select name="context">
                     <option value="">All contexts</option>
                     <?php foreach ($contexts as $ctx): ?>
@@ -1076,151 +1224,162 @@ function gt_translations_page() {
                         </option>
                     <?php endforeach; ?>
                 </select>
-                
+
                 <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="Search..." />
-                
+
                 <button type="submit" class="button">Filter</button>
-                
+
                 <?php if ($status_filter || $context_filter || $search || $source_filter || $page_filter): ?>
                     <a href="<?php echo admin_url('admin.php?page=gemini-translator-list'); ?>" class="button">Clear</a>
                 <?php endif; ?>
             </form>
-            
-            <div class="tablenav-pages" style="margin-top: 10px;">
-                <span class="displaying-num"><?php echo $total_items; ?> items</span>
+
+            <div style="margin-top: 10px; display: flex; gap: 15px; align-items: center;">
+                <span class="displaying-num"><?php echo intval($total_strings); ?> strings across <?php echo intval($total_source_pages); ?> pages</span>
+                <?php if (!empty($groups)): ?>
+                    <button type="button" class="button button-small" id="gt-expand-all">Expand All</button>
+                    <button type="button" class="button button-small" id="gt-collapse-all">Collapse All</button>
+                <?php endif; ?>
             </div>
         </div>
-        
-        <!-- Table -->
-        <table class="wp-list-table widefat fixed striped">
-            <thead>
-                <tr>
-                    <th style="width: 40px;">ID</th>
-                    <th style="width: 200px;">Page / Product</th>
-                    <th style="width: 100px;">Context</th>
-                    <th>Original</th>
-                    <th>Translation</th>
-                    <th style="width: 80px;">Status</th>
-                    <th style="width: 80px;">Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php if (empty($items)): ?>
-                    <tr>
-                        <td colspan="7">No translations found.</td>
-                    </tr>
-                <?php else: ?>
-                    <?php foreach ($items as $item): ?>
-                        <?php 
-                        $page_title = get_the_title($item->source_id);
-                        $page_url = get_permalink($item->source_id);
-                        $edit_url = get_edit_post_link($item->source_id);
-                        ?>
-                        <tr id="row-<?php echo $item->id; ?>">
-                            <td><?php echo $item->id; ?></td>
-                            <td>
-                                <strong>
-                                    <?php if ($page_url): ?>
-                                        <a href="<?php echo esc_url($page_url); ?>" target="_blank" title="View page">
-                                            <?php echo esc_html(wp_trim_words($page_title, 5) ?: "ID: {$item->source_id}"); ?>
-                                        </a>
-                                    <?php else: ?>
-                                        <?php echo esc_html($page_title ?: "ID: {$item->source_id}"); ?>
-                                    <?php endif; ?>
-                                </strong>
-                                <div class="row-actions">
-                                    <span class="source-type" style="color: #666; font-size: 11px;">
-                                        <?php echo esc_html($item->source_type); ?>
-                                    </span>
-                                    <?php if ($page_url): ?>
-                                        | <a href="<?php echo esc_url($page_url); ?>" target="_blank" style="font-size: 11px;">View</a>
-                                    <?php endif; ?>
-                                    <?php if ($edit_url): ?>
-                                        | <a href="<?php echo esc_url($edit_url); ?>" target="_blank" style="font-size: 11px;">Edit</a>
-                                    <?php endif; ?>
-                                    | <a href="<?php echo admin_url("admin.php?page=gemini-translator-list&source_id={$item->source_id}"); ?>" style="font-size: 11px;">
-                                        Filter this page
-                                    </a>
-                                </div>
-                            </td>
-                            <td>
-                                <span class="context-badge" style="background: #f0f0f0; padding: 2px 8px; border-radius: 3px; font-size: 11px;">
-                                    <?php echo esc_html($item->context); ?>
-                                </span>
-                            </td>
-                            <td>
-                                <div style="max-height: 80px; overflow-y: auto; font-size: 13px;">
-                                    <?php echo esc_html(wp_trim_words($item->original_string, 20)); ?>
-                                </div>
-                            </td>
-                            <td>
-                                <div class="translation-display" id="display-<?php echo $item->id; ?>" style="max-height: 80px; overflow-y: auto; font-size: 13px;">
-                                    <?php echo esc_html(wp_trim_words($item->translated_string, 20)); ?>
-                                </div>
-                                <form method="post" class="translation-form" id="form-<?php echo $item->id; ?>" style="display: none;">
-                                    <?php wp_nonce_field('gt_save_translation_action'); ?>
-                                    <input type="hidden" name="translation_id" value="<?php echo $item->id; ?>" />
-                                    <textarea name="translated_string" rows="3" style="width: 100%;"><?php echo esc_textarea($item->translated_string); ?></textarea>
-                                    <div style="margin-top: 5px;">
-                                        <button type="submit" name="gt_save_translation" class="button button-primary button-small">Save</button>
-                                        <button type="button" class="button button-small cancel-edit" data-id="<?php echo $item->id; ?>">Cancel</button>
-                                    </div>
-                                </form>
-                            </td>
-                            <td>
-                                <?php
-                                $status_colors = [
-                                    'pending' => '#f0ad4e',
-                                    'translated' => '#5cb85c',
-                                    'edited' => '#0073aa',
-                                ];
-                                $color = $status_colors[$item->status] ?? '#999';
-                                ?>
-                                <span style="background: <?php echo $color; ?>; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px;">
-                                    <?php echo esc_html($item->status); ?>
-                                </span>
-                            </td>
-                            <td>
-                                <button type="button" class="button button-small edit-translation" data-id="<?php echo $item->id; ?>">
-                                    Edit
-                                </button>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
-                <?php endif; ?>
-            </tbody>
-        </table>
-        
-        <!-- Pagination -->
+
+        <?php if (empty($groups)): ?>
+            <p>No translations found.</p>
+        <?php else: ?>
+            <?php
+            $status_colors = [
+                'pending' => '#f0ad4e',
+                'translated' => '#5cb85c',
+                'edited' => '#0073aa',
+            ];
+            foreach ($groups as $source_id => $group):
+                $page_title = get_the_title($source_id);
+                $page_url = get_permalink($source_id);
+                $edit_url = get_edit_post_link($source_id);
+                if (empty($page_title)) $page_title = "ID: {$source_id}";
+                $pending_label = $group['pending'] > 0 ? ", {$group['pending']} pending" : '';
+            ?>
+            <div class="gt-accordion-group" style="margin-bottom: 1px;">
+                <div class="gt-accordion-header" data-source="<?php echo intval($source_id); ?>" style="background: #f9f9f9; border: 1px solid #ddd; padding: 10px 15px; cursor: pointer; display: flex; align-items: center; gap: 10px; user-select: none;">
+                    <span class="gt-accordion-arrow dashicons dashicons-arrow-right-alt2" style="transition: transform 0.15s;"></span>
+                    <strong style="flex: 1;">
+                        <?php echo esc_html($page_title); ?>
+                        <span style="font-weight: normal; color: #666; font-size: 12px; margin-left: 8px;">
+                            [<?php echo esc_html($group['source_type']); ?>] &mdash; <?php echo intval($group['total']); ?> strings<?php echo esc_html($pending_label); ?>
+                        </span>
+                    </strong>
+                    <?php if ($page_url): ?>
+                        <a href="<?php echo esc_url($page_url); ?>" target="_blank" class="button button-small" onclick="event.stopPropagation();">View</a>
+                    <?php endif; ?>
+                    <?php if ($edit_url): ?>
+                        <a href="<?php echo esc_url($edit_url); ?>" target="_blank" class="button button-small" onclick="event.stopPropagation();">Edit Post</a>
+                    <?php endif; ?>
+                </div>
+                <div class="gt-accordion-body" data-source="<?php echo intval($source_id); ?>" style="display: none; border: 1px solid #ddd; border-top: 0;">
+                    <table class="wp-list-table widefat fixed striped" style="border: 0;">
+                        <thead>
+                            <tr>
+                                <th style="width: 40px;">ID</th>
+                                <th style="width: 90px;">Context</th>
+                                <th>Original</th>
+                                <th>Translation</th>
+                                <th style="width: 80px;">Status</th>
+                                <th style="width: 70px;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($group['items'] as $item): ?>
+                                <tr id="row-<?php echo intval($item->id); ?>">
+                                    <td><?php echo intval($item->id); ?></td>
+                                    <td>
+                                        <span style="background: #f0f0f0; padding: 2px 8px; border-radius: 3px; font-size: 11px;">
+                                            <?php echo esc_html($item->context); ?>
+                                        </span>
+                                    </td>
+                                    <td>
+                                        <div style="max-height: 80px; overflow-y: auto; font-size: 13px;">
+                                            <?php echo esc_html(wp_trim_words($item->original_string, 20)); ?>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div class="translation-display" id="display-<?php echo intval($item->id); ?>" style="max-height: 80px; overflow-y: auto; font-size: 13px;">
+                                            <?php echo esc_html(wp_trim_words($item->translated_string, 20)); ?>
+                                        </div>
+                                        <form method="post" class="translation-form" id="form-<?php echo intval($item->id); ?>" style="display: none;">
+                                            <?php wp_nonce_field('gt_save_translation_action'); ?>
+                                            <input type="hidden" name="translation_id" value="<?php echo intval($item->id); ?>" />
+                                            <textarea name="translated_string" rows="3" style="width: 100%;"><?php echo esc_textarea($item->translated_string); ?></textarea>
+                                            <div style="margin-top: 5px;">
+                                                <button type="submit" name="gt_save_translation" class="button button-primary button-small">Save</button>
+                                                <button type="button" class="button button-small cancel-edit" data-id="<?php echo intval($item->id); ?>">Cancel</button>
+                                            </div>
+                                        </form>
+                                    </td>
+                                    <td>
+                                        <?php $color = $status_colors[$item->status] ?? '#999'; ?>
+                                        <span style="background: <?php echo esc_attr($color); ?>; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px;">
+                                            <?php echo esc_html($item->status); ?>
+                                        </span>
+                                    </td>
+                                    <td>
+                                        <button type="button" class="button button-small edit-translation" data-id="<?php echo intval($item->id); ?>">Edit</button>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <?php endforeach; ?>
+        <?php endif; ?>
+
+        <!-- Page-level Pagination -->
         <?php if ($total_pages > 1): ?>
             <div class="tablenav bottom">
                 <div class="tablenav-pages">
                     <?php
-                    $pagination_args = [
+                    echo paginate_links([
                         'base' => add_query_arg('paged', '%#%'),
                         'format' => '',
                         'total' => $total_pages,
                         'current' => $current_page,
                         'prev_text' => '&laquo;',
                         'next_text' => '&raquo;',
-                    ];
-                    echo paginate_links($pagination_args);
+                    ]);
                     ?>
                 </div>
             </div>
         <?php endif; ?>
     </div>
-    
+
     <script>
     jQuery(document).ready(function($) {
-        $('.edit-translation').on('click', function() {
+        // Accordion toggle
+        $('.gt-accordion-header').on('click', function() {
+            var $body = $(this).next('.gt-accordion-body');
+            var $arrow = $(this).find('.gt-accordion-arrow');
+            $body.slideToggle(150);
+            $arrow.toggleClass('gt-arrow-open');
+        });
+
+        // Expand / Collapse all
+        $('#gt-expand-all').on('click', function() {
+            $('.gt-accordion-body').slideDown(150);
+            $('.gt-accordion-arrow').addClass('gt-arrow-open');
+        });
+        $('#gt-collapse-all').on('click', function() {
+            $('.gt-accordion-body').slideUp(150);
+            $('.gt-accordion-arrow').removeClass('gt-arrow-open');
+        });
+
+        // Inline editing
+        $(document).on('click', '.edit-translation', function() {
             var id = $(this).data('id');
             $('#display-' + id).hide();
             $('#form-' + id).show();
             $(this).hide();
         });
-        
-        $('.cancel-edit').on('click', function() {
+        $(document).on('click', '.cancel-edit', function() {
             var id = $(this).data('id');
             $('#form-' + id).hide();
             $('#display-' + id).show();
@@ -1228,6 +1387,13 @@ function gt_translations_page() {
         });
     });
     </script>
+
+    <style>
+        .gt-accordion-arrow { transition: transform 0.15s; }
+        .gt-accordion-arrow.gt-arrow-open { transform: rotate(90deg); }
+        .gt-accordion-header:hover { background: #f0f0f0 !important; }
+        .wrap .tablenav.top { height: auto; }
+    </style>
     <?php
 }
 
@@ -1269,14 +1435,14 @@ function gt_settings_page() {
                     <td>
                         <select id="gt_source_language" name="gt_source_language">
                             <?php foreach ($languages as $code => $name): ?>
-                                <option value="<?php echo $code; ?>" <?php selected($source_lang, $code); ?>>
-                                    <?php echo $name; ?>
+                                <option value="<?php echo esc_attr($code); ?>" <?php selected($source_lang, $code); ?>>
+                                    <?php echo esc_html($name); ?>
                                 </option>
                             <?php endforeach; ?>
                         </select>
                         <p class="description">
-                            The original language of your site content. 
-                            WordPress detected: <strong><?php echo $languages[$wp_lang] ?? $wp_lang; ?></strong>
+                            The original language of your site content.
+                            WordPress detected: <strong><?php echo esc_html($languages[$wp_lang] ?? $wp_lang); ?></strong>
                         </p>
                     </td>
                 </tr>
@@ -1289,8 +1455,8 @@ function gt_settings_page() {
                             <option value="">Select language...</option>
                             <?php foreach ($languages as $code => $name): ?>
                                 <?php if ($code !== $source_lang): ?>
-                                    <option value="<?php echo $code; ?>" <?php selected($target_lang, $code); ?>>
-                                        <?php echo $name; ?>
+                                    <option value="<?php echo esc_attr($code); ?>" <?php selected($target_lang, $code); ?>>
+                                        <?php echo esc_html($name); ?>
                                     </option>
                                 <?php endif; ?>
                             <?php endforeach; ?>
@@ -1309,15 +1475,15 @@ function gt_settings_page() {
         <table class="widefat" style="max-width: 400px;">
             <tr>
                 <td><strong>WordPress Locale:</strong></td>
-                <td><?php echo get_locale(); ?></td>
+                <td><?php echo esc_html(get_locale()); ?></td>
             </tr>
             <tr>
                 <td><strong>Site Language:</strong></td>
-                <td><?php echo $languages[$source_lang] ?? $source_lang; ?></td>
+                <td><?php echo esc_html($languages[$source_lang] ?? $source_lang); ?></td>
             </tr>
             <tr>
                 <td><strong>Target Language:</strong></td>
-                <td><?php echo $target_lang ? ($languages[$target_lang] ?? $target_lang) : 'Not set'; ?></td>
+                <td><?php echo esc_html($target_lang ? ($languages[$target_lang] ?? $target_lang) : 'Not set'); ?></td>
             </tr>
         </table>
     </div>
@@ -1384,6 +1550,10 @@ function gt_switcher_style_page() {
                     <h2>Dimensions</h2>
                     <table class="form-table">
                         <tr>
+                            <th>Border Width (px)</th>
+                            <td><input type="number" name="gt_switcher_style[border_width]" value="<?php echo esc_attr($s['border_width']); ?>" min="0" max="10" class="small-text gt-range-field" data-var="borderWidth" /></td>
+                        </tr>
+                        <tr>
                             <th>Border Radius (px)</th>
                             <td><input type="number" name="gt_switcher_style[border_radius]" value="<?php echo esc_attr($s['border_radius']); ?>" min="0" max="50" class="small-text gt-range-field" data-var="borderRadius" /></td>
                         </tr>
@@ -1414,6 +1584,20 @@ function gt_switcher_style_page() {
                                     <input type="checkbox" name="gt_switcher_style[shadow]" value="1" <?php checked($s['shadow'], '1'); ?> class="gt-check-field" data-var="shadow" />
                                     Enable drop shadow
                                 </label>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th>Font Family</th>
+                            <td>
+                                <?php $available_fonts = gt_get_available_fonts(); ?>
+                                <select name="gt_switcher_style[font_family]" class="gt-select-field" data-var="fontFamily">
+                                    <option value="inherit" <?php selected($s['font_family'], 'inherit'); ?>>Inherit from site</option>
+                                    <?php foreach ($available_fonts as $value => $label): ?>
+                                        <option value="<?php echo esc_attr($value); ?>" <?php selected($s['font_family'], $value); ?>>
+                                            <?php echo esc_html($label); ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
                             </td>
                         </tr>
                         <tr>
@@ -1477,7 +1661,7 @@ function gt_switcher_style_page() {
             gap: <?php echo intval($s['gap']); ?>px;
             border-radius: <?php echo intval($s['border_radius']); ?>px;
             overflow: hidden;
-            border: 1px solid <?php echo esc_attr($s['border_color']); ?>;
+            border: <?php echo intval($s['border_width']); ?>px solid <?php echo esc_attr($s['border_color']); ?>;
             <?php if ($s['shadow'] === '1'): ?>
             box-shadow: 0 2px 8px rgba(0,0,0,0.12);
             <?php endif; ?>
@@ -1486,6 +1670,7 @@ function gt_switcher_style_page() {
             display: inline-block;
             padding: <?php echo intval($s['padding_v']); ?>px <?php echo intval($s['padding_h']); ?>px;
             font-size: <?php echo intval($s['font_size']); ?>px;
+            <?php if ($s['font_family'] !== 'inherit'): ?>font-family: <?php echo $s['font_family']; ?>;<?php endif; ?>
             background: <?php echo esc_attr($s['bg_color']); ?>;
             color: <?php echo esc_attr($s['text_color']); ?>;
             text-decoration: none;
@@ -1504,9 +1689,10 @@ function gt_switcher_style_page() {
         .gt-preview-select {
             padding: <?php echo intval($s['padding_v']); ?>px <?php echo intval($s['padding_h']); ?>px;
             font-size: <?php echo intval($s['font_size']); ?>px;
+            <?php if ($s['font_family'] !== 'inherit'): ?>font-family: <?php echo $s['font_family']; ?>;<?php endif; ?>
             background: <?php echo esc_attr($s['bg_color']); ?>;
             color: <?php echo esc_attr($s['text_color']); ?>;
-            border: 1px solid <?php echo esc_attr($s['border_color']); ?>;
+            border: <?php echo intval($s['border_width']); ?>px solid <?php echo esc_attr($s['border_color']); ?>;
             border-radius: <?php echo intval($s['border_radius']); ?>px;
             <?php if ($s['shadow'] === '1'): ?>
             box-shadow: 0 2px 8px rgba(0,0,0,0.12);
@@ -1560,19 +1746,23 @@ function gt_switcher_style_page() {
             var hoverBg = getVal('hoverBgColor');
             var hoverText = getVal('hoverTextColor');
             var border = getVal('borderColor');
+            var borderW = parseInt(getVal('borderWidth')) || 1;
             var radius = parseInt(getVal('borderRadius')) || 0;
             var size = parseInt(getVal('fontSize')) || 14;
             var padH = parseInt(getVal('paddingH')) || 0;
             var padV = parseInt(getVal('paddingV')) || 0;
             var gap = parseInt(getVal('gap')) || 0;
             var shadow = getVal('shadow');
+            var fontFamily = getVal('fontFamily');
 
             var boxShadow = shadow ? '0 2px 8px rgba(0,0,0,0.12)' : 'none';
+            var fontCSS = (fontFamily && fontFamily !== 'inherit') ? fontFamily : '';
 
             // Buttons container
             $('#gt-preview-buttons').css({
                 gap: gap + 'px',
                 borderRadius: radius + 'px',
+                borderWidth: borderW + 'px',
                 borderColor: border,
                 boxShadow: boxShadow
             });
@@ -1582,7 +1772,8 @@ function gt_switcher_style_page() {
                 padding: padV + 'px ' + padH + 'px',
                 fontSize: size + 'px',
                 background: bg,
-                color: text
+                color: text,
+                fontFamily: fontCSS
             });
 
             // Active button
@@ -1590,7 +1781,8 @@ function gt_switcher_style_page() {
                 padding: padV + 'px ' + padH + 'px',
                 fontSize: size + 'px',
                 background: activeBg,
-                color: activeText
+                color: activeText,
+                fontFamily: fontCSS
             });
 
             // Dropdown
@@ -1599,9 +1791,11 @@ function gt_switcher_style_page() {
                 fontSize: size + 'px',
                 background: bg,
                 color: text,
+                borderWidth: borderW + 'px',
                 borderColor: border,
                 borderRadius: radius + 'px',
-                boxShadow: boxShadow
+                boxShadow: boxShadow,
+                fontFamily: fontCSS
             });
 
             // Update labels
@@ -1753,13 +1947,25 @@ function gt_sync_language_cookie() {
     if (!empty($lang_from_url)) {
         // Visiting /{lang}/ — set cookie to target language
         if (!isset($_COOKIE['gt_language']) || $_COOKIE['gt_language'] !== $lang_from_url) {
-            setcookie('gt_language', $lang_from_url, time() + YEAR_IN_SECONDS, '/');
+            setcookie('gt_language', $lang_from_url, [
+                'expires'  => time() + YEAR_IN_SECONDS,
+                'path'     => '/',
+                'secure'   => is_ssl(),
+                'httponly'  => false,
+                'samesite' => 'Lax',
+            ]);
             $_COOKIE['gt_language'] = $lang_from_url;
         }
     } else {
         // Visiting non-prefixed URL — reset cookie to source language
         if (isset($_COOKIE['gt_language']) && $_COOKIE['gt_language'] !== $source_lang) {
-            setcookie('gt_language', $source_lang, time() + YEAR_IN_SECONDS, '/');
+            setcookie('gt_language', $source_lang, [
+                'expires'  => time() + YEAR_IN_SECONDS,
+                'path'     => '/',
+                'secure'   => is_ssl(),
+                'httponly'  => false,
+                'samesite' => 'Lax',
+            ]);
             $_COOKIE['gt_language'] = $source_lang;
         }
     }
@@ -1801,7 +2007,9 @@ add_filter('woocommerce_product_get_permalink', 'gt_prefix_permalink', 10, 1);
 
 // Prefix the home URL on frontend when translated
 function gt_prefix_home_url($url, $path) {
-    if (is_admin() || !gt_should_translate()) {
+    static $filtering = false;
+
+    if ($filtering || is_admin() || !gt_should_translate()) {
         return $url;
     }
 
@@ -1812,7 +2020,12 @@ function gt_prefix_home_url($url, $path) {
         return $url;
     }
 
-    return rtrim($url, '/') . '/' . $target_lang . '/';
+    // Prevent recursion
+    $filtering = true;
+    $result = rtrim($url, '/') . '/' . $target_lang . '/';
+    $filtering = false;
+
+    return $result;
 }
 add_filter('home_url', 'gt_prefix_home_url', 10, 2);
 
@@ -1832,25 +2045,41 @@ function gt_flush_rewrite_rules() {
 register_activation_hook(__FILE__, 'gt_flush_rewrite_rules');
 register_deactivation_hook(__FILE__, 'flush_rewrite_rules');
 
+// Load all translations into a static cache (called once per request)
+function gt_load_translation_cache() {
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
+    }
+
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'gt_translations';
+    $target_lang = get_option('gt_target_language');
+
+    $results = $wpdb->get_results($wpdb->prepare(
+        "SELECT string_hash, translated_string FROM $table_name
+        WHERE language_code = %s AND status IN ('translated', 'edited') AND translated_string IS NOT NULL",
+        $target_lang
+    ));
+
+    $cache = [];
+    foreach ($results as $row) {
+        $cache[$row->string_hash] = $row->translated_string;
+    }
+
+    return $cache;
+}
+
 // Get translation for a string
 function gt_get_translation($original_string) {
     if (!gt_should_translate()) {
         return $original_string;
     }
-    
-    global $wpdb;
-    $table_name = $wpdb->prefix . 'gt_translations';
-    $target_lang = get_option('gt_target_language');
-    $string_hash = md5($original_string);
-    
-    $translation = $wpdb->get_var($wpdb->prepare(
-        "SELECT translated_string FROM $table_name 
-        WHERE string_hash = %s AND language_code = %s AND status IN ('translated', 'edited')",
-        $string_hash,
-        $target_lang
-    ));
-    
-    return $translation ? $translation : $original_string;
+
+    $cache = gt_load_translation_cache();
+    $string_hash = hash('sha256', $original_string);
+
+    return isset($cache[$string_hash]) ? $cache[$string_hash] : $original_string;
 }
 
 // Output frontend switcher CSS
@@ -1862,12 +2091,14 @@ function gt_frontend_switcher_css() {
     $padH = intval($s['padding_h']);
     $fontSize = intval($s['font_size']);
     $gap = intval($s['gap']);
+    $borderW = intval($s['border_width']);
+    $fontFamily = $s['font_family'] ?? 'inherit';
     ?>
     <style id="gt-switcher-css">
     .gt-language-switcher.gt-buttons {
         display: inline-flex;
         gap: <?php echo $gap; ?>px;
-        border: 1px solid <?php echo esc_attr($s['border_color']); ?>;
+        border: <?php echo $borderW; ?>px solid <?php echo esc_attr($s['border_color']); ?>;
         border-radius: <?php echo $radius; ?>px;
         overflow: hidden;
         box-shadow: <?php echo $shadow; ?>;
@@ -1877,6 +2108,7 @@ function gt_frontend_switcher_css() {
         padding: <?php echo $padV; ?>px <?php echo $padH; ?>px;
         font-size: <?php echo $fontSize; ?>px;
         line-height: 1.4;
+        <?php if ($fontFamily !== 'inherit'): ?>font-family: <?php echo $fontFamily; ?>;<?php endif; ?>
         background: <?php echo esc_attr($s['bg_color']); ?>;
         color: <?php echo esc_attr($s['text_color']); ?>;
         text-decoration: none;
@@ -1890,13 +2122,20 @@ function gt_frontend_switcher_css() {
     .gt-language-switcher.gt-buttons .gt-lang-btn.active {
         background: <?php echo esc_attr($s['active_bg_color']); ?>;
         color: <?php echo esc_attr($s['active_text_color']); ?>;
+        cursor: not-allowed;
+        pointer-events: none;
+        opacity: 0.85;
+    }
+    .gt-language-switcher.gt-dropdown select option:disabled {
+        color: #999;
     }
     .gt-language-switcher.gt-dropdown select {
         padding: <?php echo $padV; ?>px <?php echo $padH; ?>px;
         font-size: <?php echo $fontSize; ?>px;
+        <?php if ($fontFamily !== 'inherit'): ?>font-family: <?php echo $fontFamily; ?>;<?php endif; ?>
         background: <?php echo esc_attr($s['bg_color']); ?>;
         color: <?php echo esc_attr($s['text_color']); ?>;
-        border: 1px solid <?php echo esc_attr($s['border_color']); ?>;
+        border: <?php echo $borderW; ?>px solid <?php echo esc_attr($s['border_color']); ?>;
         border-radius: <?php echo $radius; ?>px;
         box-shadow: <?php echo $shadow; ?>;
         cursor: pointer;
@@ -1959,22 +2198,29 @@ function gt_language_switcher_shortcode($atts) {
     $source_label = gt_format_lang_label($source_lang, $languages[$source_lang], $fmt);
     $target_label = gt_format_lang_label($target_lang, $languages[$target_lang], $fmt);
 
+    $source_active = ($current_lang === $source_lang);
+    $target_active = ($current_lang === $target_lang);
+
     if ($atts['style'] === 'buttons'): ?>
         <div class="gt-language-switcher gt-buttons<?php echo $fixed_class; ?>">
-            <a href="<?php echo esc_url($source_url); ?>" class="gt-lang-btn <?php echo $current_lang === $source_lang ? 'active' : ''; ?>">
-                <?php echo esc_html($source_label); ?>
-            </a>
-            <a href="<?php echo esc_url($target_url); ?>" class="gt-lang-btn <?php echo $current_lang === $target_lang ? 'active' : ''; ?>">
-                <?php echo esc_html($target_label); ?>
-            </a>
+            <?php if ($source_active): ?>
+                <span class="gt-lang-btn active" aria-disabled="true"><?php echo esc_html($source_label); ?></span>
+            <?php else: ?>
+                <a href="<?php echo esc_url($source_url); ?>" class="gt-lang-btn"><?php echo esc_html($source_label); ?></a>
+            <?php endif; ?>
+            <?php if ($target_active): ?>
+                <span class="gt-lang-btn active" aria-disabled="true"><?php echo esc_html($target_label); ?></span>
+            <?php else: ?>
+                <a href="<?php echo esc_url($target_url); ?>" class="gt-lang-btn"><?php echo esc_html($target_label); ?></a>
+            <?php endif; ?>
         </div>
     <?php else: ?>
         <div class="gt-language-switcher gt-dropdown<?php echo $fixed_class; ?>">
-            <select onchange="window.location.href=this.value">
-                <option value="<?php echo esc_url($source_url); ?>" <?php selected($current_lang, $source_lang); ?>>
+            <select onchange="if(this.options[this.selectedIndex].disabled)return;window.location.href=this.value">
+                <option value="<?php echo esc_url($source_url); ?>" <?php selected($source_active); ?> <?php disabled($source_active); ?>>
                     <?php echo esc_html($source_label); ?>
                 </option>
-                <option value="<?php echo esc_url($target_url); ?>" <?php selected($current_lang, $target_lang); ?>>
+                <option value="<?php echo esc_url($target_url); ?>" <?php selected($target_active); ?> <?php disabled($target_active); ?>>
                     <?php echo esc_html($target_label); ?>
                 </option>
             </select>
@@ -1986,26 +2232,20 @@ function gt_language_switcher_shortcode($atts) {
 }
 add_shortcode('gt_language_switcher', 'gt_language_switcher_shortcode');
 
-// Filter WooCommerce product title
+// Filter WooCommerce product title — only when translating, skip admin
 function gt_translate_product_title($title, $id) {
-    if (get_post_type($id) === 'product') {
-        return gt_get_translation($title);
+    if (is_admin() || !gt_should_translate()) {
+        return $title;
     }
-    return $title;
+    return gt_get_translation($title);
 }
 add_filter('the_title', 'gt_translate_product_title', 10, 2);
 
-// Filter WooCommerce product content
-function gt_translate_product_content($content) {
-    if (is_product() || is_shop() || is_product_category()) {
-        return gt_get_translation($content);
-    }
-    return $content;
-}
-add_filter('the_content', 'gt_translate_product_content', 10, 1);
-
 // Filter WooCommerce product short description
 function gt_translate_product_excerpt($excerpt) {
+    if (is_admin() || !gt_should_translate()) {
+        return $excerpt;
+    }
     if (is_product() || is_shop() || is_product_category()) {
         return gt_get_translation($excerpt);
     }
@@ -2034,15 +2274,25 @@ function gt_get_elementor_translations() {
     return $cached;
 }
 
-// Apply Elementor translations to content string
+// Apply Elementor translations to content string using strtr for single-pass replacement
 function gt_apply_elementor_translations($content) {
-    $translations = gt_get_elementor_translations();
-    foreach ($translations as $t) {
-        if (!empty($t->translated_string) && !empty($t->original_string)) {
-            $content = str_replace($t->original_string, $t->translated_string, $content);
+    static $replacement_map = null;
+
+    if ($replacement_map === null) {
+        $replacement_map = [];
+        $translations = gt_get_elementor_translations();
+        foreach ($translations as $t) {
+            if (!empty($t->translated_string) && !empty($t->original_string)) {
+                $replacement_map[$t->original_string] = $t->translated_string;
+            }
         }
     }
-    return $content;
+
+    if (empty($replacement_map)) {
+        return $content;
+    }
+
+    return strtr($content, $replacement_map);
 }
 
 // Filter Elementor widget content
@@ -2054,22 +2304,22 @@ function gt_translate_elementor_widget($content, $widget) {
 }
 add_filter('elementor/widget/render_content', 'gt_translate_elementor_widget', 10, 2);
 
-// Also filter the_content for Elementor pages
+// Single the_content filter for all translation (products + Elementor pages)
 function gt_translate_page_content($content) {
-    if (!gt_should_translate()) {
+    if (is_admin() || !gt_should_translate()) {
         return $content;
     }
 
-    // Skip product pages — already handled by gt_translate_product_content
+    // Product pages: translate entire content as a single string
     if (is_product() || is_shop() || is_product_category()) {
-        return $content;
+        return gt_get_translation($content);
     }
 
-    // Check if this is an Elementor page
+    // Elementor pages: apply string replacements
     if (defined('ELEMENTOR_VERSION') && \Elementor\Plugin::$instance->documents->get(get_the_ID())) {
         $content = gt_apply_elementor_translations($content);
     }
-    
+
     return $content;
 }
 add_filter('the_content', 'gt_translate_page_content', 999, 1);
