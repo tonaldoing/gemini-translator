@@ -2190,7 +2190,12 @@ function gt_language_switcher_shortcode($atts) {
     if (strpos($current_path, $target_lang . '/') === 0 || $current_path === $target_lang) {
         $current_path = substr($current_path, strlen($target_lang) + 1);
     }
+    // Temporarily remove the home_url filter to prevent the language slug
+    // from being re-appended when generating the source (clean) URL.
+    remove_filter('home_url', 'gt_prefix_home_url', 10);
     $source_url = home_url('/' . $current_path);
+    add_filter('home_url', 'gt_prefix_home_url', 10, 2);
+
     $target_url = home_url('/' . $target_lang . '/' . $current_path);
 
     $fixed_class = ($s['position'] !== 'none') ? ' gt-switcher-fixed' : '';
