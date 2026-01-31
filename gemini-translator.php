@@ -917,6 +917,7 @@ function gt_admin_scripts($hook) {
     wp_localize_script('gt-admin', 'gt_ajax', [
         'url' => admin_url('admin-ajax.php'),
         'nonce' => wp_create_nonce('gt_ajax_translate'),
+        'save_nonce' => wp_create_nonce('gt_ajax_save_translation'),
     ]);
 }
 add_action('admin_enqueue_scripts', 'gt_admin_scripts');
@@ -949,26 +950,6 @@ function gt_handle_actions() {
         }
     }
 
-    // Handle inline edit save
-    if (isset($_POST['gt_save_translation']) && check_admin_referer('gt_save_translation_action')) {
-        global $wpdb;
-        $table_name = $wpdb->prefix . 'gt_translations';
-
-        $id = intval($_POST['translation_id']);
-        $new_translation = wp_kses_post($_POST['translated_string']);
-
-        $wpdb->update(
-            $table_name,
-            [
-                'translated_string' => $new_translation,
-                'status' => 'edited',
-            ],
-            ['id' => $id]
-        );
-
-        add_settings_error('gt_messages', 'gt_save_success', 'Translation saved!', 'success');
-    }
-
     if (isset($_POST['gt_scan_elementor']) && check_admin_referer('gt_scan_elementor_action')) {
         $count = gt_scan_elementor();
         add_settings_error('gt_messages', 'gt_scan_elementor_success', sprintf('Scanned %d strings from Elementor.', $count), 'success');
@@ -991,6 +972,44 @@ function gt_handle_actions() {
     }
 }
 add_action('admin_init', 'gt_handle_actions');
+
+// AJAX: Save a single translation
+function gt_ajax_save_translation() {
+    check_ajax_referer('gt_ajax_save_translation', 'nonce');
+
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(['message' => 'Permission denied.']);
+    }
+
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'gt_translations';
+
+    $id = intval($_POST['translation_id'] ?? 0);
+    $new_translation = wp_kses_post($_POST['translated_string'] ?? '');
+
+    if (!$id) {
+        wp_send_json_error(['message' => 'Invalid translation ID.']);
+    }
+
+    $result = $wpdb->update(
+        $table_name,
+        [
+            'translated_string' => $new_translation,
+            'status' => 'edited',
+        ],
+        ['id' => $id]
+    );
+
+    if ($result === false) {
+        wp_send_json_error(['message' => 'Database update failed.']);
+    }
+
+    wp_send_json_success([
+        'status' => 'edited',
+        'translated_string' => $new_translation,
+    ]);
+}
+add_action('wp_ajax_gt_save_translation', 'gt_ajax_save_translation');
 
 // Main admin page (Dashboard)
 function gt_admin_page() {
@@ -1444,15 +1463,15 @@ function gt_translations_page() {
                                         <div class="translation-display" id="display-<?php echo intval($item->id); ?>" data-raw-translation="<?php echo esc_attr($item->translated_string); ?>" style="max-height: 80px; overflow-y: auto; font-size: 13px;">
                                             <?php echo wp_kses_post($item->translated_string); ?>
                                         </div>
-                                        <form method="post" class="translation-form" id="form-<?php echo intval($item->id); ?>" style="display: none;">
-                                            <?php wp_nonce_field('gt_save_translation_action'); ?>
+                                        <div class="translation-form" id="form-<?php echo intval($item->id); ?>" style="display: none;">
                                             <input type="hidden" name="translation_id" value="<?php echo intval($item->id); ?>" />
                                             <textarea name="translated_string" rows="3" style="width: 100%;"><?php echo esc_textarea($item->translated_string); ?></textarea>
                                             <div style="margin-top: 5px;">
-                                                <button type="submit" name="gt_save_translation" class="button button-primary button-small">Save</button>
+                                                <button type="button" class="button button-primary button-small save-translation" data-id="<?php echo intval($item->id); ?>">Save</button>
                                                 <button type="button" class="button button-small cancel-edit" data-id="<?php echo intval($item->id); ?>">Cancel</button>
+                                                <span class="gt-save-feedback" id="feedback-<?php echo intval($item->id); ?>" style="display:none; color: #46b450; margin-left: 8px; font-size: 12px;">Saved!</span>
                                             </div>
-                                        </form>
+                                        </div>
                                     </td>
                                     <td>
                                         <?php $color = $status_colors[$item->status] ?? '#999'; ?>
@@ -1535,6 +1554,44 @@ function gt_translations_page() {
             $('#form-' + id).hide();
             $('#display-' + id).show();
             $('button[data-id="' + id + '"].edit-translation').show();
+        });
+
+        // AJAX save
+        $(document).on('click', '.save-translation', function() {
+            var $btn = $(this);
+            var id = $btn.data('id');
+            var $form = $('#form-' + id);
+            var newText = $form.find('textarea[name="translated_string"]').val();
+
+            $btn.prop('disabled', true).text('Saving...');
+
+            $.post(gt_ajax.url, {
+                action: 'gt_save_translation',
+                nonce: gt_ajax.save_nonce,
+                translation_id: id,
+                translated_string: newText
+            }, function(response) {
+                if (response.success) {
+                    var saved = response.data.translated_string;
+                    // Update display div content and raw attribute
+                    $('#display-' + id).html(saved).attr('data-raw-translation', saved);
+                    // Update status badge
+                    var $statusSpan = $('#row-' + id + ' td:nth-child(5) span');
+                    $statusSpan.text('edited').css('background', '#0073aa');
+                    // Switch back to display mode
+                    $form.hide();
+                    $('#display-' + id).show();
+                    $('button[data-id="' + id + '"].edit-translation').show();
+                    // Flash feedback
+                    $('#feedback-' + id).show().delay(2000).fadeOut(300);
+                } else {
+                    alert('Error: ' + (response.data && response.data.message ? response.data.message : 'Unknown error'));
+                }
+            }).fail(function() {
+                alert('Request failed. Please try again.');
+            }).always(function() {
+                $btn.prop('disabled', false).text('Save');
+            });
         });
     });
     </script>
