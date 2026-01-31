@@ -349,8 +349,25 @@ function gt_scan_elementor() {
     ");
     
     foreach ($posts_with_elementor as $post) {
-        $elementor_data = json_decode($post->meta_value, true);
-        
+        $raw = $post->meta_value;
+
+        // Elementor data may be serialized by some caching/migration plugins
+        $raw = maybe_unserialize($raw);
+
+        // If it's already an array after unserialize, use it directly
+        if (is_array($raw)) {
+            $elementor_data = $raw;
+        } else {
+            // Try decoding as-is first, then with stripslashes (common WP double-escaping)
+            $elementor_data = json_decode($raw, true);
+            if (!is_array($elementor_data)) {
+                $elementor_data = json_decode(stripslashes($raw), true);
+            }
+            if (!is_array($elementor_data)) {
+                $elementor_data = json_decode(stripslashes(stripslashes($raw)), true);
+            }
+        }
+
         if (is_array($elementor_data)) {
             $strings = gt_extract_elementor_strings($elementor_data, $post->post_id);
             
@@ -374,119 +391,139 @@ function gt_scan_elementor() {
     return $inserted;
 }
 
-// Extract strings from Elementor data recursively
+// Extract strings from Elementor data recursively using generic heuristic
 function gt_extract_elementor_strings($elements, $post_id, $strings = []) {
+    // Setting keys that contain translatable text
+    static $text_keys = [
+        'title', 'title_text', 'editor', 'text', 'description', 'description_text',
+        'content', 'heading', 'caption', 'label', 'button_text', 'inner_text',
+        'testimonial_content', 'testimonial_name', 'testimonial_job',
+        'alert_title', 'alert_description', 'tab_title', 'tab_content',
+        'item_description', 'prefix', 'suffix', 'before_text', 'after_text',
+        'highlighted_text', 'rotating_text', 'placeholder', 'field_label',
+        'button', 'ribbon_title', 'badge_text', 'price', 'sub_heading',
+        'slide_heading', 'slide_description', 'slide_button_text',
+    ];
+
+    // Repeater keys whose items may contain translatable sub-keys
+    static $repeater_keys = [
+        'tabs', 'price_list', 'slides', 'icon_list', 'social_icon_list',
+        'items', 'gallery', 'carousel', 'testimonials', 'team_members',
+        'features_list', 'steps', 'list', 'form_fields',
+    ];
+
+    // Values that look like internal settings, not translatable text
+    static $skip_values = [
+        'yes', 'no', 'none', 'top', 'bottom', 'left', 'right', 'center',
+        'middle', 'start', 'end', 'flex-start', 'flex-end', 'space-between',
+        'space-around', 'stretch', 'inherit', 'initial', 'default', 'custom',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div', 'span', 'p',
+        'px', 'em', 'rem', '%', 'vh', 'vw', 'normal', 'bold', 'italic',
+        'solid', 'dashed', 'dotted', 'double', 'groove', 'ridge',
+        'inline', 'block', 'inline-block', 'flex', 'grid',
+        'absolute', 'relative', 'fixed', 'sticky',
+        'row', 'column', 'row-reverse', 'column-reverse',
+        'cover', 'contain', 'auto', 'repeat', 'no-repeat',
+        'uppercase', 'lowercase', 'capitalize', 'full_width', 'boxed',
+    ];
+
     foreach ($elements as $element) {
-        // Get widget type
         $widget_type = $element['widgetType'] ?? $element['elType'] ?? 'unknown';
-        
-        // Extract settings
-        if (isset($element['settings'])) {
+
+        if (isset($element['settings']) && is_array($element['settings'])) {
             $settings = $element['settings'];
-            
-            // Heading widget
-            if (isset($settings['title'])) {
-                $strings[] = [
-                    'text' => $settings['title'],
-                    'context' => 'elementor_heading',
-                ];
-            }
-            
-            // Text editor widget
-            if (isset($settings['editor'])) {
-                $strings[] = [
-                    'text' => $settings['editor'],
-                    'context' => 'elementor_text',
-                ];
-            }
-            
-            // Button widget
-            if (isset($settings['text'])) {
-                $strings[] = [
-                    'text' => $settings['text'],
-                    'context' => 'elementor_button',
-                ];
-            }
-            
-            // Image box widget
-            if (isset($settings['title_text'])) {
-                $strings[] = [
-                    'text' => $settings['title_text'],
-                    'context' => 'elementor_image_box_title',
-                ];
-            }
-            if (isset($settings['description_text'])) {
-                $strings[] = [
-                    'text' => $settings['description_text'],
-                    'context' => 'elementor_image_box_desc',
-                ];
-            }
-            
-            if (isset($settings['description'])) {
-                $strings[] = [
-                    'text' => $settings['description'],
-                    'context' => 'elementor_cta_desc',
-                ];
-            }
-            
-            // Testimonial
-            if (isset($settings['testimonial_content'])) {
-                $strings[] = [
-                    'text' => $settings['testimonial_content'],
-                    'context' => 'elementor_testimonial',
-                ];
-            }
-            if (isset($settings['testimonial_name'])) {
-                $strings[] = [
-                    'text' => $settings['testimonial_name'],
-                    'context' => 'elementor_testimonial_name',
-                ];
-            }
-            
-            // Accordion / Toggle
-            if (isset($settings['tabs']) && is_array($settings['tabs'])) {
-                foreach ($settings['tabs'] as $tab) {
-                    if (isset($tab['tab_title'])) {
+
+            // Check direct text keys
+            foreach ($text_keys as $key) {
+                if (isset($settings[$key]) && is_string($settings[$key])) {
+                    $val = trim($settings[$key]);
+                    if ($val !== '' && gt_is_translatable_value($val, $skip_values)) {
                         $strings[] = [
-                            'text' => $tab['tab_title'],
-                            'context' => 'elementor_accordion_title',
-                        ];
-                    }
-                    if (isset($tab['tab_content'])) {
-                        $strings[] = [
-                            'text' => $tab['tab_content'],
-                            'context' => 'elementor_accordion_content',
+                            'text' => $val,
+                            'context' => 'elementor_' . $key,
                         ];
                     }
                 }
             }
-            
-            // Price list
-            if (isset($settings['price_list']) && is_array($settings['price_list'])) {
-                foreach ($settings['price_list'] as $item) {
-                    if (isset($item['title'])) {
-                        $strings[] = [
-                            'text' => $item['title'],
-                            'context' => 'elementor_price_title',
-                        ];
-                    }
-                    if (isset($item['item_description'])) {
-                        $strings[] = [
-                            'text' => $item['item_description'],
-                            'context' => 'elementor_price_desc',
-                        ];
+
+            // Check repeater arrays for translatable sub-keys
+            foreach ($repeater_keys as $rkey) {
+                if (isset($settings[$rkey]) && is_array($settings[$rkey])) {
+                    foreach ($settings[$rkey] as $item) {
+                        if (!is_array($item)) {
+                            continue;
+                        }
+                        foreach ($text_keys as $key) {
+                            if (isset($item[$key]) && is_string($item[$key])) {
+                                $val = trim($item[$key]);
+                                if ($val !== '' && gt_is_translatable_value($val, $skip_values)) {
+                                    $strings[] = [
+                                        'text' => $val,
+                                        'context' => 'elementor_' . $rkey . '_' . $key,
+                                    ];
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        
+
         // Recursively process child elements
         if (isset($element['elements']) && is_array($element['elements'])) {
             $strings = gt_extract_elementor_strings($element['elements'], $post_id, $strings);
         }
     }
-    
+
     return $strings;
+}
+
+// Check if a string value looks like translatable user content
+function gt_is_translatable_value($value, $skip_values) {
+    $lower = strtolower($value);
+
+    // Skip known setting tokens
+    if (in_array($lower, $skip_values, true)) {
+        return false;
+    }
+
+    // Skip hex colors
+    if (preg_match('/^#[0-9a-f]{3,8}$/i', $value)) {
+        return false;
+    }
+
+    // Skip rgb/rgba values
+    if (preg_match('/^rgba?\s*\(/i', $value)) {
+        return false;
+    }
+
+    // Skip pure numbers (with optional unit)
+    if (preg_match('/^-?[\d.]+(px|em|rem|%|vh|vw|s|ms)?$/', $value)) {
+        return false;
+    }
+
+    // Skip URLs
+    if (filter_var($value, FILTER_VALIDATE_URL)) {
+        return false;
+    }
+
+    // Skip email addresses
+    if (filter_var($value, FILTER_VALIDATE_EMAIL)) {
+        return false;
+    }
+
+    // Must have at least one letter
+    if (!preg_match('/[a-zA-Z\x{00C0}-\x{024F}\x{0400}-\x{04FF}\x{0600}-\x{06FF}\x{4E00}-\x{9FFF}]/u', $value)) {
+        return false;
+    }
+
+    // Strip tags and check visible text is at least 2 chars
+    $text_only = trim(strip_tags($value));
+    if (mb_strlen($text_only) < 2) {
+        return false;
+    }
+
+    return true;
 }
 
 // Insert string if not exists (with filtering)
@@ -538,7 +575,7 @@ function gt_insert_string($string, $context, $source_type, $source_id, $language
     ));
     
     if (!$exists) {
-        $wpdb->insert($table_name, [
+        $result = $wpdb->insert($table_name, [
             'original_string' => $string,
             'string_hash' => $string_hash,
             'language_code' => $language,
@@ -547,9 +584,9 @@ function gt_insert_string($string, $context, $source_type, $source_id, $language
             'source_id' => $source_id,
             'status' => 'pending',
         ]);
-        return true;
+        return ($result !== false);
     }
-    
+
     return false;
 }
 
