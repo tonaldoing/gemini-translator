@@ -594,8 +594,16 @@ function gt_insert_string($string, $context, $source_type, $source_id, $language
 function gt_clear_elementor_strings() {
     global $wpdb;
     $table_name = $wpdb->prefix . 'gt_translations';
-    
+
     return $wpdb->delete($table_name, ['source_type' => 'elementor']);
+}
+
+// Clear all WooCommerce product strings (for re-scanning)
+function gt_clear_product_strings() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'gt_translations';
+
+    return $wpdb->delete($table_name, ['source_type' => 'product']);
 }
 
 // Clear orphaned strings (from deleted/trashed pages/products)
@@ -885,6 +893,11 @@ function gt_handle_actions() {
         add_settings_error('gt_messages', 'gt_scan_elementor_success', sprintf('Scanned %d strings from Elementor.', $count), 'success');
     }
 
+    if (isset($_POST['gt_clear_products']) && check_admin_referer('gt_clear_products_action')) {
+        gt_clear_product_strings();
+        add_settings_error('gt_messages', 'gt_clear_products_success', 'Cleared WooCommerce strings. Ready to re-scan.', 'success');
+    }
+
     if (isset($_POST['gt_clear_elementor']) && check_admin_referer('gt_clear_elementor_action')) {
         gt_clear_elementor_strings();
         add_settings_error('gt_messages', 'gt_clear_success', 'Cleared Elementor strings. Ready to re-scan.', 'success');
@@ -1035,8 +1048,15 @@ function gt_admin_page() {
                         </button>
                     </form>
                     <form method="post" style="margin-top: 10px;">
+                        <?php wp_nonce_field('gt_clear_products_action'); ?>
+                        <button type="submit" name="gt_clear_products" class="button button-link-delete"
+                            onclick="return confirm('This will delete all WooCommerce strings. Continue?');">
+                            Clear WooCommerce Strings
+                        </button>
+                    </form>
+                    <form method="post" style="margin-top: 5px;">
                         <?php wp_nonce_field('gt_clear_elementor_action'); ?>
-                        <button type="submit" name="gt_clear_elementor" class="button button-link-delete" 
+                        <button type="submit" name="gt_clear_elementor" class="button button-link-delete"
                             onclick="return confirm('This will delete all Elementor strings. Continue?');">
                             Clear Elementor Strings
                         </button>
