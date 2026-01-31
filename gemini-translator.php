@@ -1514,9 +1514,17 @@ function gt_translations_page() {
         // Inline editing
         $(document).on('click', '.edit-translation', function() {
             var id = $(this).data('id');
-            var rawHtml = $('#display-' + id).attr('data-raw-translation');
-            if (typeof rawHtml !== 'undefined') {
-                $('#form-' + id + ' textarea[name="translated_string"]').val(rawHtml);
+            var $textarea = $('#form-' + id + ' textarea[name="translated_string"]');
+            var rawTranslation = $('#display-' + id).attr('data-raw-translation');
+            if (rawTranslation && rawTranslation.length > 0) {
+                $textarea.val(rawTranslation);
+            } else if ($.trim($textarea.val()).length === 0) {
+                // Pre-fill empty translations with the raw original string as a template
+                var $originalDiv = $('#row-' + id + ' td:nth-child(3) div[data-raw-original]');
+                var rawOriginal = $originalDiv.attr('data-raw-original');
+                if (rawOriginal) {
+                    $textarea.val(rawOriginal);
+                }
             }
             $('#display-' + id).hide();
             $('#form-' + id).show();
