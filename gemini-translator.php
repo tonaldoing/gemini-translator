@@ -349,8 +349,25 @@ function gt_scan_elementor() {
     ");
     
     foreach ($posts_with_elementor as $post) {
-        $elementor_data = json_decode($post->meta_value, true);
-        
+        $raw = $post->meta_value;
+
+        // Elementor data may be serialized by some caching/migration plugins
+        $raw = maybe_unserialize($raw);
+
+        // If it's already an array after unserialize, use it directly
+        if (is_array($raw)) {
+            $elementor_data = $raw;
+        } else {
+            // Try decoding as-is first, then with stripslashes (common WP double-escaping)
+            $elementor_data = json_decode($raw, true);
+            if (!is_array($elementor_data)) {
+                $elementor_data = json_decode(stripslashes($raw), true);
+            }
+            if (!is_array($elementor_data)) {
+                $elementor_data = json_decode(stripslashes(stripslashes($raw)), true);
+            }
+        }
+
         if (is_array($elementor_data)) {
             $strings = gt_extract_elementor_strings($elementor_data, $post->post_id);
             
