@@ -2004,6 +2004,64 @@ add_filter('page_link', 'gt_prefix_permalink', 10, 2);
 add_filter('post_type_link', 'gt_prefix_permalink', 10, 2);
 add_filter('term_link', 'gt_prefix_permalink', 10, 1);
 add_filter('woocommerce_product_get_permalink', 'gt_prefix_permalink', 10, 1);
+// Rewrite all internal URLs in the final HTML output via output buffering
+function gt_start_url_rewrite_buffer() {
+    if (is_admin() || !gt_should_translate()) {
+        return;
+    }
+    ob_start('gt_rewrite_html_urls');
+}
+add_action('template_redirect', 'gt_start_url_rewrite_buffer', 1);
+
+function gt_rewrite_html_urls($html) {
+    if (empty($html)) {
+        return $html;
+    }
+
+    $target_lang = get_option('gt_target_language');
+    if (empty($target_lang)) {
+        return $html;
+    }
+
+    // Build home URL without the language prefix filter interfering
+    remove_filter('home_url', 'gt_prefix_home_url', 10);
+    $home_url = home_url('/');
+    add_filter('home_url', 'gt_prefix_home_url', 10, 2);
+
+    $prefix = $home_url . $target_lang . '/';
+    $escaped_home = preg_quote($home_url, '#');
+
+    // Split HTML on gt-no-rewrite markers, only rewrite the unprotected parts
+    $parts = preg_split('#(<!-- gt-no-rewrite -->.*?<!-- /gt-no-rewrite -->)#s', $html, -1, PREG_SPLIT_DELIM_CAPTURE);
+
+    foreach ($parts as &$part) {
+        // Skip protected sections (the captured delimiters)
+        if (strpos($part, '<!-- gt-no-rewrite -->') === 0) {
+            continue;
+        }
+
+        // Rewrite href="..." pointing to internal URLs
+        $part = preg_replace_callback(
+            '#(href=["\'])(' . $escaped_home . ')([^"\']*["\'])#i',
+            function ($m) use ($home_url, $prefix, $target_lang) {
+                $path = $m[3];
+                // Skip if already prefixed
+                if (strpos($m[2] . $path, $prefix) === 0) {
+                    return $m[0];
+                }
+                // Skip admin, wp-content, wp-includes, wp-json URLs
+                if (preg_match('#^(wp-admin|wp-content|wp-includes|wp-json|wp-login)#', $path)) {
+                    return $m[0];
+                }
+                return $m[1] . $prefix . $path;
+            },
+            $part
+        );
+    }
+    unset($part);
+
+    return implode('', $parts);
+}
 
 // Prefix the home URL on frontend when translated
 function gt_prefix_home_url($url, $path) {
@@ -2207,7 +2265,7 @@ function gt_language_switcher_shortcode($atts) {
     $target_active = ($current_lang === $target_lang);
 
     if ($atts['style'] === 'buttons'): ?>
-        <div class="gt-language-switcher gt-buttons<?php echo $fixed_class; ?>">
+        <!-- gt-no-rewrite --><div class="gt-language-switcher gt-buttons<?php echo $fixed_class; ?>">
             <?php if ($source_active): ?>
                 <span class="gt-lang-btn active" aria-disabled="true"><?php echo esc_html($source_label); ?></span>
             <?php else: ?>
@@ -2218,9 +2276,9 @@ function gt_language_switcher_shortcode($atts) {
             <?php else: ?>
                 <a href="<?php echo esc_url($target_url); ?>" class="gt-lang-btn"><?php echo esc_html($target_label); ?></a>
             <?php endif; ?>
-        </div>
+        </div><!-- /gt-no-rewrite -->
     <?php else: ?>
-        <div class="gt-language-switcher gt-dropdown<?php echo $fixed_class; ?>">
+        <!-- gt-no-rewrite --><div class="gt-language-switcher gt-dropdown<?php echo $fixed_class; ?>">
             <select onchange="if(this.options[this.selectedIndex].disabled)return;window.location.href=this.value">
                 <option value="<?php echo esc_url($source_url); ?>" <?php selected($source_active); ?> <?php disabled($source_active); ?>>
                     <?php echo esc_html($source_label); ?>
@@ -2229,7 +2287,7 @@ function gt_language_switcher_shortcode($atts) {
                     <?php echo esc_html($target_label); ?>
                 </option>
             </select>
-        </div>
+        </div><!-- /gt-no-rewrite -->
     <?php endif; ?>
     <?php
 
