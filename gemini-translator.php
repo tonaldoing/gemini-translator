@@ -3,7 +3,7 @@
  * Plugin Name: Gemini Translator
  * Plugin URI: https://github.com/tonaldoing/gemini-translator
  * Description: Translate your WooCommerce store using Google Gemini AI
- * Version: 0.1.0
+ * Version: 0.2.0
  * Author: Tomás Vilas for Amrak Solutions
  * Author URI: https://github.com/tonaldoing
  * License: GPL v2 or later
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('GEMINI_TRANSLATOR_VERSION', '0.1.0');
+define('GEMINI_TRANSLATOR_VERSION', '0.2.0');
 define('GEMINI_TRANSLATOR_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('GEMINI_TRANSLATOR_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -47,12 +47,61 @@ function gt_activate() {
         KEY source_id (source_id)
     ) $charset_collate;";
     
+    $locations_table = $wpdb->prefix . 'gt_string_locations';
+    $sql2 = "CREATE TABLE $locations_table (
+        id bigint(20) NOT NULL AUTO_INCREMENT,
+        translation_id bigint(20) NOT NULL,
+        source_type varchar(50) NOT NULL,
+        source_id bigint(20) NOT NULL,
+        PRIMARY KEY (id),
+        UNIQUE KEY translation_source (translation_id, source_id),
+        KEY translation_id (translation_id),
+        KEY source_id (source_id)
+    ) $charset_collate;";
+
     require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
     dbDelta($sql);
-    
+    dbDelta($sql2);
+
     add_option('gt_db_version', GEMINI_TRANSLATOR_VERSION);
 }
 register_activation_hook(__FILE__, 'gt_activate');
+
+// Upgrade DB schema if needed
+function gt_check_db_upgrade() {
+    $installed_version = get_option('gt_db_version', '0.1.0');
+    if (version_compare($installed_version, GEMINI_TRANSLATOR_VERSION, '>=')) {
+        return;
+    }
+
+    global $wpdb;
+    $charset_collate = $wpdb->get_charset_collate();
+    $locations_table = $wpdb->prefix . 'gt_string_locations';
+    $table_name = $wpdb->prefix . 'gt_translations';
+
+    $sql2 = "CREATE TABLE $locations_table (
+        id bigint(20) NOT NULL AUTO_INCREMENT,
+        translation_id bigint(20) NOT NULL,
+        source_type varchar(50) NOT NULL,
+        source_id bigint(20) NOT NULL,
+        PRIMARY KEY (id),
+        UNIQUE KEY translation_source (translation_id, source_id),
+        KEY translation_id (translation_id),
+        KEY source_id (source_id)
+    ) $charset_collate;";
+
+    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+    dbDelta($sql2);
+
+    // Backfill existing data
+    $wpdb->query(
+        "INSERT IGNORE INTO $locations_table (translation_id, source_type, source_id)
+         SELECT id, source_type, source_id FROM $table_name WHERE source_id IS NOT NULL"
+    );
+
+    update_option('gt_db_version', GEMINI_TRANSLATOR_VERSION);
+}
+add_action('admin_init', 'gt_check_db_upgrade');
 
 // Add admin menu
 function gt_admin_menu() {
@@ -502,23 +551,26 @@ function gt_is_translatable_value($value, $skip_values) {
         return false;
     }
 
-    // Skip URLs
-    if (filter_var($value, FILTER_VALIDATE_URL)) {
-        return false;
+    // Check if the string contains HTML tags
+    $has_html = $value !== strip_tags($value);
+
+    // Skip URLs and emails only if the string has no HTML structure
+    if (!$has_html) {
+        if (filter_var($value, FILTER_VALIDATE_URL)) {
+            return false;
+        }
+        if (filter_var($value, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
     }
 
-    // Skip email addresses
-    if (filter_var($value, FILTER_VALIDATE_EMAIL)) {
-        return false;
-    }
-
-    // Must have at least one letter
-    if (!preg_match('/[a-zA-Z\x{00C0}-\x{024F}\x{0400}-\x{04FF}\x{0600}-\x{06FF}\x{4E00}-\x{9FFF}]/u', $value)) {
-        return false;
-    }
-
-    // Strip tags and check visible text is at least 2 chars
+    // Must have at least one letter (check stripped text for HTML strings)
     $text_only = trim(strip_tags($value));
+    if (!preg_match('/[a-zA-Z\x{00C0}-\x{024F}\x{0400}-\x{04FF}\x{0600}-\x{06FF}\x{4E00}-\x{9FFF}]/u', $text_only)) {
+        return false;
+    }
+
+    // Visible text must be at least 2 chars
     if (mb_strlen($text_only) < 2) {
         return false;
     }
@@ -553,19 +605,22 @@ function gt_insert_string($string, $context, $source_type, $source_id, $language
     if (empty($text_only)) {
         return false;
     }
-    
-    // Skip URLs
-    if (filter_var($string, FILTER_VALIDATE_URL)) {
-        return false;
-    }
-    
-    // Skip email addresses
-    if (filter_var($string, FILTER_VALIDATE_EMAIL)) {
-        return false;
+
+    // Skip URLs and emails only if the string has no HTML structure
+    $has_html = $string !== strip_tags($string);
+    if (!$has_html) {
+        if (filter_var($string, FILTER_VALIDATE_URL)) {
+            return false;
+        }
+        if (filter_var($string, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
     }
     
     $table_name = $wpdb->prefix . 'gt_translations';
     $string_hash = hash('sha256', $string);
+
+    $locations_table = $wpdb->prefix . 'gt_string_locations';
 
     // Check if already exists (any source, same string)
     $exists = $wpdb->get_var($wpdb->prepare(
@@ -573,7 +628,7 @@ function gt_insert_string($string, $context, $source_type, $source_id, $language
         $string_hash,
         $language
     ));
-    
+
     if (!$exists) {
         $result = $wpdb->insert($table_name, [
             'original_string' => $string,
@@ -584,7 +639,23 @@ function gt_insert_string($string, $context, $source_type, $source_id, $language
             'source_id' => $source_id,
             'status' => 'pending',
         ]);
-        return ($result !== false);
+        if ($result !== false) {
+            $translation_id = $wpdb->insert_id;
+            $wpdb->query($wpdb->prepare(
+                "INSERT IGNORE INTO $locations_table (translation_id, source_type, source_id) VALUES (%d, %s, %d)",
+                $translation_id, $source_type, $source_id
+            ));
+            return true;
+        }
+        return false;
+    }
+
+    // String exists — add this location (UNIQUE key prevents duplicates)
+    if ($source_id) {
+        $wpdb->query($wpdb->prepare(
+            "INSERT IGNORE INTO $locations_table (translation_id, source_type, source_id) VALUES (%d, %s, %d)",
+            $exists, $source_type, $source_id
+        ));
     }
 
     return false;
@@ -594,41 +665,52 @@ function gt_insert_string($string, $context, $source_type, $source_id, $language
 function gt_clear_elementor_strings() {
     global $wpdb;
     $table_name = $wpdb->prefix . 'gt_translations';
+    $locations_table = $wpdb->prefix . 'gt_string_locations';
 
-    return $wpdb->delete($table_name, ['source_type' => 'elementor']);
+    // Remove elementor locations
+    $wpdb->query("DELETE FROM $locations_table WHERE source_type = 'elementor'");
+    // Remove translation rows with zero remaining locations
+    $wpdb->query("DELETE t FROM $table_name t LEFT JOIN $locations_table loc ON t.id = loc.translation_id WHERE loc.id IS NULL");
 }
 
 // Clear all WooCommerce product strings (for re-scanning)
 function gt_clear_product_strings() {
     global $wpdb;
     $table_name = $wpdb->prefix . 'gt_translations';
+    $locations_table = $wpdb->prefix . 'gt_string_locations';
 
-    return $wpdb->delete($table_name, ['source_type' => 'product']);
+    // Remove product locations
+    $wpdb->query("DELETE FROM $locations_table WHERE source_type = 'product'");
+    // Remove translation rows with zero remaining locations
+    $wpdb->query("DELETE t FROM $table_name t LEFT JOIN $locations_table loc ON t.id = loc.translation_id WHERE loc.id IS NULL");
 }
 
 // Clear orphaned strings (from deleted/trashed pages/products)
 function gt_clear_orphaned_strings() {
     global $wpdb;
     $table_name = $wpdb->prefix . 'gt_translations';
+    $locations_table = $wpdb->prefix . 'gt_string_locations';
 
-    // Remove strings where post is deleted entirely OR in trash
+    // Find orphaned location rows (post deleted or trashed)
     $orphans = $wpdb->get_results(
-        "SELECT t.source_id, COUNT(*) as cnt
-        FROM $table_name t
-        LEFT JOIN {$wpdb->posts} p ON t.source_id = p.ID
-        WHERE t.source_id IS NOT NULL
-          AND (p.ID IS NULL OR p.post_status IN ('trash', 'auto-draft'))
-        GROUP BY t.source_id"
+        "SELECT loc.source_id, COUNT(*) as cnt
+        FROM $locations_table loc
+        LEFT JOIN {$wpdb->posts} p ON loc.source_id = p.ID
+        WHERE (p.ID IS NULL OR p.post_status IN ('trash', 'auto-draft'))
+        GROUP BY loc.source_id"
     );
 
     $deleted_pages = 0;
     $deleted_strings = 0;
 
     foreach ($orphans as $orphan) {
-        $wpdb->delete($table_name, ['source_id' => $orphan->source_id]);
+        $wpdb->delete($locations_table, ['source_id' => $orphan->source_id]);
         $deleted_pages++;
         $deleted_strings += (int) $orphan->cnt;
     }
+
+    // Remove translation rows with zero remaining locations
+    $wpdb->query("DELETE t FROM $table_name t LEFT JOIN $locations_table loc ON t.id = loc.translation_id WHERE loc.id IS NULL AND t.source_id IS NOT NULL");
 
     return ['pages' => $deleted_pages, 'strings' => $deleted_strings];
 }
@@ -636,14 +718,13 @@ function gt_clear_orphaned_strings() {
 // Count orphaned strings (deleted or trashed posts) without removing them
 function gt_count_orphaned_strings() {
     global $wpdb;
-    $table_name = $wpdb->prefix . 'gt_translations';
+    $locations_table = $wpdb->prefix . 'gt_string_locations';
 
     return (int) $wpdb->get_var(
         "SELECT COUNT(*)
-        FROM $table_name t
-        LEFT JOIN {$wpdb->posts} p ON t.source_id = p.ID
-        WHERE t.source_id IS NOT NULL
-          AND (p.ID IS NULL OR p.post_status IN ('trash', 'auto-draft'))"
+        FROM $locations_table loc
+        LEFT JOIN {$wpdb->posts} p ON loc.source_id = p.ID
+        WHERE (p.ID IS NULL OR p.post_status IN ('trash', 'auto-draft'))"
     );
 }
 
@@ -1148,17 +1229,18 @@ function gt_translations_page() {
         $where .= $wpdb->prepare(" AND t.context = %s", $context_filter);
     }
     if ($source_filter) {
-        $where .= $wpdb->prepare(" AND t.source_type = %s", $source_filter);
+        $where .= $wpdb->prepare(" AND loc.source_type = %s", $source_filter);
     }
     if ($page_filter) {
-        $where .= $wpdb->prepare(" AND t.source_id = %d", $page_filter);
+        $where .= $wpdb->prepare(" AND loc.source_id = %d", $page_filter);
     }
     if ($search) {
         $where .= $wpdb->prepare(" AND (t.original_string LIKE %s OR t.translated_string LIKE %s)", '%' . $wpdb->esc_like($search) . '%', '%' . $wpdb->esc_like($search) . '%');
     }
 
-    // Only show strings belonging to published posts
-    $valid_join = "FROM $table_name t INNER JOIN {$wpdb->posts} p ON t.source_id = p.ID AND p.post_status IN ('publish', 'draft', 'private')";
+    // Only show strings belonging to published posts (via locations junction table)
+    $locations_table = $wpdb->prefix . 'gt_string_locations';
+    $valid_join = "FROM $table_name t INNER JOIN $locations_table loc ON t.id = loc.translation_id INNER JOIN {$wpdb->posts} p ON loc.source_id = p.ID AND p.post_status IN ('publish', 'draft', 'private')";
 
     // Page-level pagination
     $pages_per_view = 10;
@@ -1166,12 +1248,12 @@ function gt_translations_page() {
     $page_offset = ($current_page - 1) * $pages_per_view;
 
     // Count distinct pages matching filters
-    $total_source_pages = (int) $wpdb->get_var("SELECT COUNT(DISTINCT t.source_id) $valid_join $where");
+    $total_source_pages = (int) $wpdb->get_var("SELECT COUNT(DISTINCT loc.source_id) $valid_join $where");
     $total_pages = max(1, ceil($total_source_pages / $pages_per_view));
 
     // Get the source_ids for the current page view
     $source_ids = $wpdb->get_col($wpdb->prepare(
-        "SELECT DISTINCT t.source_id $valid_join $where ORDER BY t.source_id LIMIT %d, %d",
+        "SELECT DISTINCT loc.source_id $valid_join $where ORDER BY loc.source_id LIMIT %d, %d",
         $page_offset, $pages_per_view
     ));
 
@@ -1181,11 +1263,11 @@ function gt_translations_page() {
         $id_placeholders = implode(',', array_fill(0, count($source_ids), '%d'));
 
         $stats_query = $wpdb->prepare(
-            "SELECT t.source_id, t.source_type, COUNT(*) as total,
+            "SELECT loc.source_id, loc.source_type, COUNT(*) as total,
                 SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) as pending
-            $valid_join $where AND t.source_id IN ($id_placeholders)
-            GROUP BY t.source_id, t.source_type
-            ORDER BY t.source_id",
+            $valid_join $where AND loc.source_id IN ($id_placeholders)
+            GROUP BY loc.source_id, loc.source_type
+            ORDER BY loc.source_id",
             ...$source_ids
         );
         $stats = $wpdb->get_results($stats_query);
@@ -1200,13 +1282,13 @@ function gt_translations_page() {
         }
 
         $items_query = $wpdb->prepare(
-            "SELECT t.* $valid_join $where AND t.source_id IN ($id_placeholders) ORDER BY t.source_id, t.id",
+            "SELECT t.*, loc.source_id as loc_source_id, loc.source_type as loc_source_type $valid_join $where AND loc.source_id IN ($id_placeholders) ORDER BY loc.source_id, t.id",
             ...$source_ids
         );
         $items = $wpdb->get_results($items_query);
 
         foreach ($items as $item) {
-            $groups[$item->source_id]['items'][] = $item;
+            $groups[$item->loc_source_id]['items'][] = $item;
         }
     }
 
@@ -1215,8 +1297,8 @@ function gt_translations_page() {
 
     // Get available filter options (valid posts only)
     $contexts = $wpdb->get_col("SELECT DISTINCT t.context $valid_join ORDER BY t.context");
-    $source_types = $wpdb->get_col("SELECT DISTINCT t.source_type $valid_join ORDER BY t.source_type");
-    $all_source_pages = $wpdb->get_results("SELECT DISTINCT t.source_id, t.source_type $valid_join WHERE t.source_id IS NOT NULL ORDER BY t.source_type, t.source_id");
+    $source_types = $wpdb->get_col("SELECT DISTINCT loc.source_type $valid_join ORDER BY loc.source_type");
+    $all_source_pages = $wpdb->get_results("SELECT DISTINCT loc.source_id, loc.source_type $valid_join WHERE loc.source_id IS NOT NULL ORDER BY loc.source_type, loc.source_id");
     $page_options = [];
     foreach ($all_source_pages as $p) {
         $title = get_the_title($p->source_id);
@@ -1354,13 +1436,13 @@ function gt_translations_page() {
                                         </span>
                                     </td>
                                     <td>
-                                        <div style="max-height: 80px; overflow-y: auto; font-size: 13px;">
-                                            <?php echo esc_html(wp_trim_words($item->original_string, 20)); ?>
+                                        <div data-raw-original="<?php echo esc_attr($item->original_string); ?>" style="max-height: 80px; overflow-y: auto; font-size: 13px;">
+                                            <?php echo wp_kses_post($item->original_string); ?>
                                         </div>
                                     </td>
                                     <td>
-                                        <div class="translation-display" id="display-<?php echo intval($item->id); ?>" style="max-height: 80px; overflow-y: auto; font-size: 13px;">
-                                            <?php echo esc_html(wp_trim_words($item->translated_string, 20)); ?>
+                                        <div class="translation-display" id="display-<?php echo intval($item->id); ?>" data-raw-translation="<?php echo esc_attr($item->translated_string); ?>" style="max-height: 80px; overflow-y: auto; font-size: 13px;">
+                                            <?php echo wp_kses_post($item->translated_string); ?>
                                         </div>
                                         <form method="post" class="translation-form" id="form-<?php echo intval($item->id); ?>" style="display: none;">
                                             <?php wp_nonce_field('gt_save_translation_action'); ?>
@@ -1432,6 +1514,10 @@ function gt_translations_page() {
         // Inline editing
         $(document).on('click', '.edit-translation', function() {
             var id = $(this).data('id');
+            var rawHtml = $('#display-' + id).attr('data-raw-translation');
+            if (typeof rawHtml !== 'undefined') {
+                $('#form-' + id + ' textarea[name="translated_string"]').val(rawHtml);
+            }
             $('#display-' + id).hide();
             $('#form-' + id).show();
             $(this).hide();
