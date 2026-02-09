@@ -3,7 +3,7 @@
  * Plugin Name: Gemini Translator
  * Plugin URI: https://github.com/tonaldoing/gemini-translator
  * Description: Translate your WooCommerce store using Google Gemini AI
- * Version: 0.2.0
+ * Version: 0.3.0
  * Author: Tomás Vilas for Amrak Solutions
  * Author URI: https://github.com/tonaldoing
  * License: GPL v2 or later
@@ -16,9 +16,69 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('GEMINI_TRANSLATOR_VERSION', '0.2.0');
+define('GEMINI_TRANSLATOR_VERSION', '0.3.0');
 define('GEMINI_TRANSLATOR_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('GEMINI_TRANSLATOR_PLUGIN_URL', plugin_dir_url(__FILE__));
+
+/**
+ * Get database table names.
+ *
+ * @since 0.3.0
+ * @return array Associative array with 'translations' and 'locations' keys.
+ */
+function gt_get_table_names() {
+    global $wpdb;
+    return [
+        'translations' => $wpdb->prefix . 'gt_translations',
+        'locations'    => $wpdb->prefix . 'gt_string_locations',
+    ];
+}
+
+/**
+ * Verify AJAX request with nonce and capability check.
+ *
+ * @since 0.3.0
+ * @param string $nonce_action The nonce action name.
+ * @param string $nonce_name   The nonce field name in $_POST.
+ * @param string $capability   Required capability (default: manage_options).
+ * @return bool True if valid, sends JSON error and exits if not.
+ */
+function gt_verify_ajax_request($nonce_action, $nonce_name = 'nonce', $capability = 'manage_options') {
+    if (!check_ajax_referer($nonce_action, $nonce_name, false)) {
+        wp_send_json_error(['message' => 'Security check failed.']);
+    }
+    if (!current_user_can($capability)) {
+        wp_send_json_error(['message' => 'Permission denied.']);
+    }
+    return true;
+}
+
+/**
+ * Display an admin notice.
+ *
+ * @since 0.3.0
+ * @param string $message The notice message.
+ * @param string $type    Notice type: success, error, warning, info.
+ */
+function gt_admin_notice($message, $type = 'info') {
+    add_settings_error('gt_messages', 'gt_notice', $message, $type);
+}
+
+/**
+ * Mask an API key for display.
+ *
+ * @since 0.3.0
+ * @param string $api_key The full API key.
+ * @return string Masked key (e.g., "AIza****...****xyz") or empty string.
+ */
+function gt_mask_api_key($api_key) {
+    if (empty($api_key) || strlen($api_key) < 8) {
+        return '';
+    }
+    $first = substr($api_key, 0, 4);
+    $last = substr($api_key, -3);
+    return $first . '****...****' . $last;
+}
 
 // Create database table on activation
 function gt_activate() {
@@ -399,6 +459,7 @@ function gt_scan_elementor() {
     
     foreach ($posts_with_elementor as $post) {
         $raw = $post->meta_value;
+        $elementor_data = null;
 
         // Elementor data may be serialized by some caching/migration plugins
         $raw = maybe_unserialize($raw);
@@ -406,15 +467,24 @@ function gt_scan_elementor() {
         // If it's already an array after unserialize, use it directly
         if (is_array($raw)) {
             $elementor_data = $raw;
-        } else {
-            // Try decoding as-is first, then with stripslashes (common WP double-escaping)
+        } elseif (is_string($raw) && !empty($raw)) {
+            // Try decoding JSON - handle WordPress double-escaping
             $elementor_data = json_decode($raw, true);
-            if (!is_array($elementor_data)) {
+            if (json_last_error() !== JSON_ERROR_NONE) {
                 $elementor_data = json_decode(stripslashes($raw), true);
             }
-            if (!is_array($elementor_data)) {
-                $elementor_data = json_decode(stripslashes(stripslashes($raw)), true);
+        }
+
+        // Validate the data structure
+        if (!is_array($elementor_data) || empty($elementor_data)) {
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                error_log(sprintf(
+                    'Gemini Translator: Invalid Elementor data for post ID %d. JSON error: %s',
+                    $post->post_id,
+                    json_last_error_msg()
+                ));
             }
+            continue;
         }
 
         if (is_array($elementor_data)) {
@@ -918,6 +988,7 @@ function gt_admin_scripts($hook) {
         'url' => admin_url('admin-ajax.php'),
         'nonce' => wp_create_nonce('gt_ajax_translate'),
         'save_nonce' => wp_create_nonce('gt_ajax_save_translation'),
+        'update_nonce' => wp_create_nonce('gt_check_updates'),
     ]);
 }
 add_action('admin_enqueue_scripts', 'gt_admin_scripts');
@@ -1065,7 +1136,27 @@ function gt_admin_page() {
     ?>
     <div class="wrap">
         <h1>Gemini Translator</h1>
-        
+
+        <!-- Version Info -->
+        <div class="gt-version-info" style="margin: 10px 0 20px; padding: 10px 15px; background: #f8f9fa; border-left: 4px solid #0073aa; display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+            <span>
+                <strong>Version:</strong> <?php echo esc_html(GEMINI_TRANSLATOR_VERSION); ?>
+            </span>
+            <button type="button" id="gt-check-updates-btn" class="button button-small">
+                Check for Updates
+            </button>
+            <span id="gt-update-status" style="display: none;"></span>
+            <a href="https://github.com/tonaldoing/gemini-translator/releases" target="_blank" class="button button-small" style="text-decoration: none;">
+                View Changelog
+            </a>
+        </div>
+
+        <div id="gt-update-details" style="display: none; margin-bottom: 20px; padding: 15px; background: #fff8e5; border: 1px solid #f0c36d; border-radius: 4px;">
+            <strong style="color: #826200;">&#x1f389; Update Available!</strong>
+            <p id="gt-update-message" style="margin: 10px 0;"></p>
+            <a href="<?php echo admin_url('plugins.php'); ?>" class="button button-primary">Go to Plugins Page</a>
+        </div>
+
         <?php if (empty($api_key) || empty($language)): ?>
             <div class="notice notice-warning">
                 <p>⚠️ Please <a href="<?php echo admin_url('admin.php?page=gemini-translator-settings'); ?>">configure your API key and language</a> to get started.</p>
@@ -1611,26 +1702,53 @@ function gt_settings_page() {
     $wp_lang = gt_get_wp_language();
     $source_lang = gt_get_source_language();
     $target_lang = get_option('gt_target_language');
+    $api_key = get_option('gt_api_key');
+    $has_key = !empty($api_key);
+    $masked_key = gt_mask_api_key($api_key);
     ?>
     <div class="wrap">
         <h1>Translator Settings</h1>
-        
+
         <form method="post" action="options.php">
             <?php settings_fields('gt_settings'); ?>
-            
+
             <table class="form-table">
                 <tr>
                     <th scope="row">
                         <label for="gt_api_key">Gemini API Key</label>
                     </th>
                     <td>
-                        <input 
-                            type="password" 
-                            id="gt_api_key" 
-                            name="gt_api_key" 
-                            value="<?php echo esc_attr(get_option('gt_api_key')); ?>" 
-                            class="regular-text"
-                        />
+                        <?php if ($has_key): ?>
+                            <div id="gt-key-masked" style="margin-bottom: 10px;">
+                                <code style="padding: 6px 10px; background: #f0f0f0; border-radius: 3px;"><?php echo esc_html($masked_key); ?></code>
+                                <button type="button" id="gt-reveal-key" class="button button-small" style="margin-left: 10px;">Show / Change</button>
+                                <span style="color: #46b450; margin-left: 10px;">&#x2713; Key configured</span>
+                            </div>
+                            <div id="gt-key-input" style="display: none;">
+                                <input
+                                    type="password"
+                                    id="gt_api_key"
+                                    name="gt_api_key"
+                                    value=""
+                                    class="regular-text"
+                                    placeholder="Enter new API key or leave blank to keep current"
+                                />
+                                <button type="button" id="gt-toggle-visibility" class="button button-small" style="margin-left: 5px;">&#x1f441;</button>
+                                <button type="button" id="gt-cancel-change" class="button button-small" style="margin-left: 5px;">Cancel</button>
+                                <p class="description" style="margin-top: 5px;">Leave blank to keep the existing key.</p>
+                            </div>
+                            <input type="hidden" id="gt_api_key_current" value="<?php echo esc_attr($api_key); ?>" />
+                        <?php else: ?>
+                            <input
+                                type="password"
+                                id="gt_api_key"
+                                name="gt_api_key"
+                                value=""
+                                class="regular-text"
+                                placeholder="Enter your API key"
+                            />
+                            <button type="button" id="gt-toggle-visibility" class="button button-small" style="margin-left: 5px;">&#x1f441;</button>
+                        <?php endif; ?>
                         <p class="description">
                             Get your API key from <a href="https://aistudio.google.com/app/apikey" target="_blank">Google AI Studio</a>
                         </p>
@@ -1695,6 +1813,45 @@ function gt_settings_page() {
             </tr>
         </table>
     </div>
+
+    <script>
+    jQuery(document).ready(function($) {
+        // Toggle password visibility
+        $('#gt-toggle-visibility').on('click', function() {
+            var $input = $('#gt_api_key');
+            if ($input.attr('type') === 'password') {
+                $input.attr('type', 'text');
+                $(this).html('&#x1f576;');
+            } else {
+                $input.attr('type', 'password');
+                $(this).html('&#x1f441;');
+            }
+        });
+
+        // Reveal key input (when key exists)
+        $('#gt-reveal-key').on('click', function() {
+            $('#gt-key-masked').hide();
+            $('#gt-key-input').show();
+            $('#gt_api_key').focus();
+        });
+
+        // Cancel change
+        $('#gt-cancel-change').on('click', function() {
+            $('#gt-key-input').hide();
+            $('#gt-key-masked').show();
+            $('#gt_api_key').val('');
+        });
+
+        // On form submit, if input is empty and we have a current key, use it
+        $('form').on('submit', function() {
+            var $input = $('#gt_api_key');
+            var $current = $('#gt_api_key_current');
+            if ($current.length && $input.val() === '') {
+                $input.val($current.val());
+            }
+        });
+    });
+    </script>
     <?php
 }
 
@@ -2026,6 +2183,270 @@ function gt_switcher_style_page() {
     </script>
     <?php
 }
+
+// ============================================
+// GITHUB UPDATER
+// ============================================
+
+/**
+ * GitHub Updater class for WordPress plugin updates.
+ *
+ * @since 0.3.0
+ */
+class GT_GitHub_Updater {
+    private $plugin_file;
+    private $plugin_slug;
+    private $github_repo;
+    private $github_api_url;
+    private $transient_key;
+    private $cache_expiration = 43200; // 12 hours
+
+    /**
+     * Constructor.
+     *
+     * @param string $plugin_file Full path to main plugin file.
+     * @param string $github_repo GitHub repository in format 'owner/repo'.
+     */
+    public function __construct($plugin_file, $github_repo) {
+        $this->plugin_file = $plugin_file;
+        $this->plugin_slug = plugin_basename($plugin_file);
+        $this->github_repo = $github_repo;
+        $this->github_api_url = 'https://api.github.com/repos/' . $github_repo . '/releases/latest';
+        $this->transient_key = 'gt_github_update_' . md5($github_repo);
+
+        add_filter('pre_set_site_transient_update_plugins', [$this, 'check_for_updates']);
+        add_filter('plugins_api', [$this, 'get_plugin_info'], 10, 3);
+        add_filter('upgrader_post_install', [$this, 'after_install'], 10, 3);
+    }
+
+    /**
+     * Get release data from cache or GitHub API.
+     *
+     * @return object|false Release data or false on failure.
+     */
+    private function get_release_data() {
+        $cached = get_transient($this->transient_key);
+        if ($cached !== false) {
+            return $cached;
+        }
+
+        $response = wp_remote_get($this->github_api_url, [
+            'headers' => [
+                'Accept' => 'application/vnd.github.v3+json',
+                'User-Agent' => 'WordPress/' . get_bloginfo('version') . '; ' . home_url(),
+            ],
+            'timeout' => 10,
+        ]);
+
+        if (is_wp_error($response)) {
+            return false;
+        }
+
+        $code = wp_remote_retrieve_response_code($response);
+        if ($code !== 200) {
+            return false;
+        }
+
+        $body = wp_remote_retrieve_body($response);
+        $data = json_decode($body);
+
+        if (!isset($data->tag_name)) {
+            return false;
+        }
+
+        // Cache the result
+        set_transient($this->transient_key, $data, $this->cache_expiration);
+
+        return $data;
+    }
+
+    /**
+     * Check for updates and add to transient.
+     *
+     * @param object $transient Plugin update transient.
+     * @return object Modified transient.
+     */
+    public function check_for_updates($transient) {
+        if (empty($transient->checked)) {
+            return $transient;
+        }
+
+        $release = $this->get_release_data();
+        if (!$release) {
+            return $transient;
+        }
+
+        // Remove 'v' prefix from version tag if present
+        $remote_version = ltrim($release->tag_name, 'v');
+        $current_version = $transient->checked[$this->plugin_slug] ?? GEMINI_TRANSLATOR_VERSION;
+
+        if (version_compare($remote_version, $current_version, '>')) {
+            // Find the zip asset (prefer .zip over source code)
+            $download_url = $release->zipball_url;
+            if (!empty($release->assets)) {
+                foreach ($release->assets as $asset) {
+                    if (strpos($asset->name, '.zip') !== false) {
+                        $download_url = $asset->browser_download_url;
+                        break;
+                    }
+                }
+            }
+
+            $plugin_data = get_plugin_data($this->plugin_file);
+
+            $transient->response[$this->plugin_slug] = (object) [
+                'slug' => dirname($this->plugin_slug),
+                'plugin' => $this->plugin_slug,
+                'new_version' => $remote_version,
+                'url' => $plugin_data['PluginURI'],
+                'package' => $download_url,
+                'icons' => [],
+                'banners' => [],
+                'tested' => '',
+                'requires_php' => '7.4',
+            ];
+        }
+
+        return $transient;
+    }
+
+    /**
+     * Provide plugin information for the update details popup.
+     *
+     * @param false|object|array $result The result object or array.
+     * @param string             $action The API action.
+     * @param object             $args   Plugin API arguments.
+     * @return false|object Plugin info or false.
+     */
+    public function get_plugin_info($result, $action, $args) {
+        if ($action !== 'plugin_information') {
+            return $result;
+        }
+
+        if (!isset($args->slug) || $args->slug !== dirname($this->plugin_slug)) {
+            return $result;
+        }
+
+        $release = $this->get_release_data();
+        if (!$release) {
+            return $result;
+        }
+
+        $plugin_data = get_plugin_data($this->plugin_file);
+        $remote_version = ltrim($release->tag_name, 'v');
+
+        // Parse release body as changelog
+        $changelog = '';
+        if (!empty($release->body)) {
+            $changelog = '<h4>Release Notes</h4>';
+            $changelog .= wpautop(esc_html($release->body));
+        }
+
+        return (object) [
+            'name' => $plugin_data['Name'],
+            'slug' => dirname($this->plugin_slug),
+            'version' => $remote_version,
+            'author' => $plugin_data['Author'],
+            'author_profile' => $plugin_data['AuthorURI'],
+            'homepage' => $plugin_data['PluginURI'],
+            'requires' => '5.0',
+            'tested' => get_bloginfo('version'),
+            'requires_php' => '7.4',
+            'downloaded' => 0,
+            'last_updated' => $release->published_at ?? '',
+            'sections' => [
+                'description' => $plugin_data['Description'],
+                'changelog' => $changelog,
+            ],
+            'download_link' => $release->zipball_url,
+        ];
+    }
+
+    /**
+     * Handle post-install cleanup (fix folder name after GitHub zipball extraction).
+     *
+     * @param bool  $response   Installation response.
+     * @param array $hook_extra Extra arguments passed to hooked filters.
+     * @param array $result     Installation result data.
+     * @return array Modified result.
+     */
+    public function after_install($response, $hook_extra, $result) {
+        global $wp_filesystem;
+
+        if (!isset($hook_extra['plugin']) || $hook_extra['plugin'] !== $this->plugin_slug) {
+            return $result;
+        }
+
+        // GitHub zipball creates a folder like 'owner-repo-hash', rename to plugin folder
+        $plugin_folder = WP_PLUGIN_DIR . '/' . dirname($this->plugin_slug);
+        $wp_filesystem->move($result['destination'], $plugin_folder);
+        $result['destination'] = $plugin_folder;
+
+        // Clear the update transient
+        delete_transient($this->transient_key);
+
+        // Reactivate plugin
+        activate_plugin($this->plugin_slug);
+
+        return $result;
+    }
+
+    /**
+     * Force refresh of update data.
+     */
+    public function force_check() {
+        delete_transient($this->transient_key);
+        delete_site_transient('update_plugins');
+    }
+
+    /**
+     * Get cached release info for display.
+     *
+     * @return object|false Release data or false.
+     */
+    public function get_cached_release() {
+        return $this->get_release_data();
+    }
+}
+
+// Initialize the GitHub updater
+function gt_init_updater() {
+    new GT_GitHub_Updater(__FILE__, 'tonaldoing/gemini-translator');
+}
+add_action('init', 'gt_init_updater');
+
+// AJAX handler for force update check
+function gt_ajax_check_updates() {
+    gt_verify_ajax_request('gt_check_updates');
+
+    $updater = new GT_GitHub_Updater(__FILE__, 'tonaldoing/gemini-translator');
+    $updater->force_check();
+    $release = $updater->get_cached_release();
+
+    if (!$release) {
+        wp_send_json_error(['message' => 'Could not connect to GitHub.']);
+    }
+
+    $remote_version = ltrim($release->tag_name, 'v');
+    $current_version = GEMINI_TRANSLATOR_VERSION;
+
+    if (version_compare($remote_version, $current_version, '>')) {
+        wp_send_json_success([
+            'update_available' => true,
+            'current' => $current_version,
+            'latest' => $remote_version,
+            'changelog' => $release->body ?? '',
+            'url' => $release->html_url ?? '',
+        ]);
+    }
+
+    wp_send_json_success([
+        'update_available' => false,
+        'current' => $current_version,
+        'latest' => $remote_version,
+    ]);
+}
+add_action('wp_ajax_gt_check_updates', 'gt_ajax_check_updates');
 
 // ============================================
 // FRONTEND FUNCTIONS
