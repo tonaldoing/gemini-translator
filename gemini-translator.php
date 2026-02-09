@@ -448,7 +448,7 @@ function gt_extract_elementor_strings($elements, $post_id, $strings = []) {
         'content', 'heading', 'caption', 'label', 'button_text', 'inner_text',
         'testimonial_content', 'testimonial_name', 'testimonial_job',
         'alert_title', 'alert_description', 'tab_title', 'tab_content',
-        'item_description', 'prefix', 'suffix', 'before_text', 'after_text',
+        'item_title', 'item_description', 'prefix', 'suffix', 'before_text', 'after_text',
         'highlighted_text', 'rotating_text', 'placeholder', 'field_label',
         'button', 'ribbon_title', 'badge_text', 'price', 'sub_heading',
         'slide_heading', 'slide_description', 'slide_button_text',
