@@ -2212,6 +2212,48 @@ add_filter('page_link', 'gt_prefix_permalink', 10, 2);
 add_filter('post_type_link', 'gt_prefix_permalink', 10, 2);
 add_filter('term_link', 'gt_prefix_permalink', 10, 1);
 add_filter('woocommerce_product_get_permalink', 'gt_prefix_permalink', 10, 1);
+
+// Prefix navigation menu links with /{lang}/
+function gt_prefix_nav_menu_link($atts, $item, $args, $depth) {
+    if (is_admin() || !gt_should_translate() || empty($atts['href'])) {
+        return $atts;
+    }
+
+    $target_lang = get_option('gt_target_language');
+    $home_url = home_url('/');
+    $prefix = home_url('/' . $target_lang . '/');
+
+    $url = $atts['href'];
+
+    // Skip if already prefixed
+    if (strpos($url, $prefix) === 0) {
+        return $atts;
+    }
+
+    // Skip external URLs, anchors, and special links
+    if (strpos($url, '#') === 0 || strpos($url, 'javascript:') === 0 || strpos($url, 'mailto:') === 0) {
+        return $atts;
+    }
+
+    // Handle absolute URLs from this site
+    if (strpos($url, $home_url) === 0) {
+        $relative = substr($url, strlen($home_url));
+        $atts['href'] = $prefix . $relative;
+        return $atts;
+    }
+
+    // Handle relative URLs (starting with /)
+    if (strpos($url, '/') === 0 && strpos($url, '//') !== 0) {
+        // Skip admin and wp- paths
+        if (preg_match('#^/(wp-admin|wp-content|wp-includes|wp-json|wp-login)#', $url)) {
+            return $atts;
+        }
+        $atts['href'] = '/' . $target_lang . $url;
+    }
+
+    return $atts;
+}
+add_filter('nav_menu_link_attributes', 'gt_prefix_nav_menu_link', 10, 4);
 // Rewrite all internal URLs in the final HTML output via output buffering
 function gt_start_url_rewrite_buffer() {
     if (is_admin() || !gt_should_translate()) {
@@ -2248,7 +2290,7 @@ function gt_rewrite_html_urls($html) {
             continue;
         }
 
-        // Rewrite href="..." pointing to internal URLs
+        // Rewrite href="..." pointing to absolute internal URLs
         $part = preg_replace_callback(
             '#(href=["\'])(' . $escaped_home . ')([^"\']*["\'])#i',
             function ($m) use ($home_url, $prefix, $target_lang) {
@@ -2262,6 +2304,24 @@ function gt_rewrite_html_urls($html) {
                     return $m[0];
                 }
                 return $m[1] . $prefix . $path;
+            },
+            $part
+        );
+
+        // Rewrite href="/" relative URLs (but not // protocol-relative)
+        $part = preg_replace_callback(
+            '#(href=["\'])(/(?!/))([^"\']*["\'])#i',
+            function ($m) use ($target_lang) {
+                $path = $m[3];
+                // Skip if already prefixed with language
+                if (preg_match('#^' . preg_quote($target_lang, '#') . '/#', ltrim($m[2] . $path, '/'))) {
+                    return $m[0];
+                }
+                // Skip admin, wp-content, wp-includes, wp-json URLs
+                if (preg_match('#^/(wp-admin|wp-content|wp-includes|wp-json|wp-login)#', $m[2])) {
+                    return $m[0];
+                }
+                return $m[1] . '/' . $target_lang . $m[2] . $path;
             },
             $part
         );
