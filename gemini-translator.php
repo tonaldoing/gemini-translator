@@ -3,7 +3,7 @@
  * Plugin Name: Gemini Translator
  * Plugin URI: https://github.com/tonaldoing/gemini-translator
  * Description: Translate your WooCommerce store using Google Gemini AI
- * Version: 0.3.1
+ * Version: 0.3.2
  * Author: Tomás Vilas for Amrak Solutions
  * Author URI: https://github.com/tonaldoing
  * License: GPL v2 or later
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('GEMINI_TRANSLATOR_VERSION', '0.3.1');
+define('GEMINI_TRANSLATOR_VERSION', '0.3.2');
 define('GEMINI_TRANSLATOR_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('GEMINI_TRANSLATOR_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -2746,6 +2746,49 @@ function gt_rewrite_html_urls($html) {
             },
             $part
         );
+
+        // Rewrite data-href and data-link attributes (used by some Elementor widgets)
+        $part = preg_replace_callback(
+            '#(data-(?:href|link)=["\'])(' . $escaped_home . ')([^"\']*["\'])#i',
+            function ($m) use ($prefix) {
+                return $m[1] . $prefix . $m[3];
+            },
+            $part
+        );
+
+        // Rewrite relative URLs in data-href and data-link
+        $part = preg_replace_callback(
+            '#(data-(?:href|link)=["\'])(/(?!/))([^"\']*["\'])#i',
+            function ($m) use ($target_lang) {
+                $path = $m[3];
+                if (preg_match('#^' . preg_quote($target_lang, '#') . '/#', ltrim($m[2] . $path, '/'))) {
+                    return $m[0];
+                }
+                if (preg_match('#^/(wp-admin|wp-content|wp-includes|wp-json|wp-login)#', $m[2])) {
+                    return $m[0];
+                }
+                return $m[1] . '/' . $target_lang . $m[2] . $path;
+            },
+            $part
+        );
+
+        // Rewrite URLs inside Elementor data-settings JSON (common pattern: "url":"...")
+        $part = preg_replace_callback(
+            '#("url"\s*:\s*")(' . $escaped_home . ')([^"]*")#i',
+            function ($m) use ($prefix) {
+                return $m[1] . $prefix . $m[3];
+            },
+            $part
+        );
+
+        // Rewrite relative URLs in data-settings JSON
+        $part = preg_replace_callback(
+            '#("url"\s*:\s*")(/(?!/|wp-admin|wp-content|wp-includes|wp-json|wp-login))([^"]*")#i',
+            function ($m) use ($target_lang) {
+                return $m[1] . '/' . $target_lang . $m[2] . $m[3];
+            },
+            $part
+        );
     }
     unset($part);
 
@@ -2913,6 +2956,116 @@ function gt_frontend_switcher_css() {
     <?php
 }
 add_action('wp_head', 'gt_frontend_switcher_css');
+
+// Output frontend JavaScript for link interception (catches Elementor buttons, logo, etc.)
+function gt_frontend_link_interceptor() {
+    if (is_admin() || !gt_should_translate()) {
+        return;
+    }
+
+    $target_lang = get_option('gt_target_language');
+    if (empty($target_lang)) {
+        return;
+    }
+
+    // Get home URL without language prefix
+    remove_filter('home_url', 'gt_prefix_home_url', 10);
+    $home_url = home_url('/');
+    add_filter('home_url', 'gt_prefix_home_url', 10, 2);
+
+    $site_host = wp_parse_url($home_url, PHP_URL_HOST);
+    ?>
+    <script id="gt-link-interceptor">
+    (function() {
+        var lang = <?php echo json_encode($target_lang); ?>;
+        var siteHost = <?php echo json_encode($site_host); ?>;
+        var homeUrl = <?php echo json_encode(rtrim($home_url, '/')); ?>;
+        var prefix = '/' + lang + '/';
+        var skipPaths = /^\/(wp-admin|wp-content|wp-includes|wp-json|wp-login)/;
+
+        function shouldRewrite(url) {
+            if (!url || url === '#' || url.indexOf('javascript:') === 0 || url.indexOf('mailto:') === 0 || url.indexOf('tel:') === 0) {
+                return false;
+            }
+            try {
+                var parsed = new URL(url, window.location.origin);
+                // Only rewrite internal URLs
+                if (parsed.host !== siteHost) {
+                    return false;
+                }
+                // Skip admin/system paths
+                if (skipPaths.test(parsed.pathname)) {
+                    return false;
+                }
+                // Skip if already prefixed
+                if (parsed.pathname.indexOf(prefix) === 0) {
+                    return false;
+                }
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        function rewriteUrl(url) {
+            try {
+                var parsed = new URL(url, window.location.origin);
+                parsed.pathname = prefix + parsed.pathname.replace(/^\//, '');
+                return parsed.href;
+            } catch (e) {
+                return url;
+            }
+        }
+
+        // Intercept all clicks on links
+        document.addEventListener('click', function(e) {
+            var link = e.target.closest('a[href]');
+            if (!link) return;
+
+            var href = link.getAttribute('href');
+            if (shouldRewrite(href)) {
+                e.preventDefault();
+                window.location.href = rewriteUrl(href);
+            }
+        }, true);
+
+        // Also intercept Elementor's dynamic link handling
+        document.addEventListener('DOMContentLoaded', function() {
+            // Rewrite any data-href or data-link attributes
+            document.querySelectorAll('[data-href], [data-link]').forEach(function(el) {
+                ['data-href', 'data-link'].forEach(function(attr) {
+                    var url = el.getAttribute(attr);
+                    if (url && shouldRewrite(url)) {
+                        el.setAttribute(attr, rewriteUrl(url));
+                    }
+                });
+            });
+
+            // Rewrite Elementor button/link settings in data-settings
+            document.querySelectorAll('[data-settings]').forEach(function(el) {
+                try {
+                    var settings = JSON.parse(el.getAttribute('data-settings'));
+                    var modified = false;
+
+                    // Check common Elementor URL fields
+                    ['link', 'url', 'button_link', 'image_link'].forEach(function(key) {
+                        if (settings[key] && settings[key].url && shouldRewrite(settings[key].url)) {
+                            settings[key].url = rewriteUrl(settings[key].url);
+                            modified = true;
+                        }
+                    });
+
+                    if (modified) {
+                        el.setAttribute('data-settings', JSON.stringify(settings));
+                    }
+                } catch (e) {}
+            });
+        });
+    })();
+    </script>
+    <?php
+}
+add_action('wp_footer', 'gt_frontend_link_interceptor', 999);
 
 // Language switcher shortcode [gt_language_switcher]
 function gt_language_switcher_shortcode($atts) {
