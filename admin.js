@@ -59,4 +59,46 @@ jQuery(document).ready(function ($) {
         $btn.prop('disabled', false).html('Translate All (<span id="gt-remaining">' + $remaining.text() + '</span> strings)');
         $remaining = $('#gt-remaining');
     }
+
+    // Update check functionality
+    var $updateBtn = $('#gt-check-updates-btn');
+    var $updateStatus = $('#gt-update-status');
+    var $updateDetails = $('#gt-update-details');
+    var $updateMessage = $('#gt-update-message');
+
+    $updateBtn.on('click', function () {
+        var $self = $(this);
+        $self.prop('disabled', true).text('Checking...');
+        $updateStatus.hide();
+
+        $.post(gt_ajax.url, {
+            action: 'gt_check_updates',
+            nonce: gt_ajax.update_nonce
+        }, function (response) {
+            if (!response.success) {
+                $updateStatus.text('Error: ' + (response.data && response.data.message || 'Unknown error'))
+                    .css('color', '#d63638').show();
+                return;
+            }
+
+            var data = response.data;
+            if (data.update_available) {
+                $updateStatus.text('Update available: v' + data.latest)
+                    .css('color', '#00a32a').show();
+                $updateMessage.html(
+                    'Current version: <strong>' + data.current + '</strong><br>' +
+                    'Latest version: <strong>' + data.latest + '</strong>'
+                );
+                $updateDetails.slideDown();
+            } else {
+                $updateStatus.text('You are running the latest version (v' + data.current + ')')
+                    .css('color', '#2271b1').show();
+                $updateDetails.hide();
+            }
+        }).fail(function () {
+            $updateStatus.text('Failed to check for updates.').css('color', '#d63638').show();
+        }).always(function () {
+            $self.prop('disabled', false).text('Check for Updates');
+        });
+    });
 });
