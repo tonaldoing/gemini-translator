@@ -1551,12 +1551,12 @@ function gt_translations_page() {
                                         </div>
                                     </td>
                                     <td>
-                                        <div class="translation-display" id="display-<?php echo intval($item->id); ?>" data-raw-translation="<?php echo esc_attr($item->translated_string); ?>" style="max-height: 80px; overflow-y: auto; font-size: 13px;">
-                                            <?php echo wp_kses_post($item->translated_string); ?>
+                                        <div class="translation-display" id="display-<?php echo intval($item->id); ?>" data-raw-translation="<?php echo esc_attr($item->translated_string ?? ''); ?>" style="max-height: 80px; overflow-y: auto; font-size: 13px;">
+                                            <?php echo wp_kses_post($item->translated_string ?? ''); ?>
                                         </div>
                                         <div class="translation-form" id="form-<?php echo intval($item->id); ?>" style="display: none;">
                                             <input type="hidden" name="translation_id" value="<?php echo intval($item->id); ?>" />
-                                            <textarea name="translated_string" rows="3" style="width: 100%;"><?php echo esc_textarea($item->translated_string); ?></textarea>
+                                            <textarea name="translated_string" rows="3" style="width: 100%;"><?php echo esc_textarea($item->translated_string ?? ''); ?></textarea>
                                             <div style="margin-top: 5px;">
                                                 <button type="button" class="button button-primary button-small save-translation" data-id="<?php echo intval($item->id); ?>">Save</button>
                                                 <button type="button" class="button button-small cancel-edit" data-id="<?php echo intval($item->id); ?>">Cancel</button>
