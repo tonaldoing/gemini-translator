@@ -3,7 +3,7 @@
  * Plugin Name: Gemini Translator
  * Plugin URI: https://github.com/tonaldoing/gemini-translator
  * Description: Translate your WooCommerce store using Google Gemini AI
- * Version: 0.3.4
+ * Version: 0.3.5
  * Author: Tomás Vilas for Amrak Solutions
  * Author URI: https://github.com/tonaldoing
  * License: GPL v2 or later
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('GEMINI_TRANSLATOR_VERSION', '0.3.4');
+define('GEMINI_TRANSLATOR_VERSION', '0.3.5');
 define('GEMINI_TRANSLATOR_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('GEMINI_TRANSLATOR_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -3191,6 +3191,18 @@ function gt_apply_elementor_translations($content) {
                 $replacement_map[$t->original_string] = $t->translated_string;
             }
         }
+    }
+
+    // Debug: add HTML comment showing translation status
+    if (isset($_GET['gt_debug']) && current_user_can('manage_options')) {
+        $debug = "\n<!-- GT Debug: " . count($replacement_map) . " translations loaded -->\n";
+        if (!empty($replacement_map)) {
+            $first_original = array_key_first($replacement_map);
+            $debug .= "<!-- GT First original (100 chars): " . esc_html(substr($first_original, 0, 100)) . " -->\n";
+            $debug .= "<!-- GT Content (100 chars): " . esc_html(substr($content, 0, 100)) . " -->\n";
+            $debug .= "<!-- GT Match found: " . (strpos($content, $first_original) !== false ? 'YES' : 'NO') . " -->\n";
+        }
+        $content = $debug . $content;
     }
 
     if (empty($replacement_map)) {
