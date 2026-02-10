@@ -12,3 +12,6 @@ Thumbs.db
 
 # Local config
 wp-config.php
+
+# Claude Code
+CLAUDE.md

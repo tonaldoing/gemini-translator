@@ -3,7 +3,7 @@
  * Plugin Name: Gemini Translator
  * Plugin URI: https://github.com/tonaldoing/gemini-translator
  * Description: Translate your WooCommerce store using Google Gemini AI
- * Version: 0.3.6
+ * Version: 0.3.7
  * Author: Tomás Vilas for Amrak Solutions
  * Author URI: https://github.com/tonaldoing
  * License: GPL v2 or later
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('GEMINI_TRANSLATOR_VERSION', '0.3.6');
+define('GEMINI_TRANSLATOR_VERSION', '0.3.7');
 define('GEMINI_TRANSLATOR_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('GEMINI_TRANSLATOR_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -2677,9 +2677,15 @@ function gt_prefix_nav_menu_link($atts, $item, $args, $depth) {
 add_filter('nav_menu_link_attributes', 'gt_prefix_nav_menu_link', 10, 4);
 // Rewrite all internal URLs in the final HTML output via output buffering
 function gt_start_url_rewrite_buffer() {
+    global $gt_buffer_post_id;
+
     if (is_admin() || !gt_should_translate()) {
         return;
     }
+
+    // Store post ID before buffer starts (needed for translations later)
+    $gt_buffer_post_id = get_queried_object_id();
+
     ob_start('gt_rewrite_html_urls');
 }
 add_action('template_redirect', 'gt_start_url_rewrite_buffer', 1);
@@ -2792,7 +2798,103 @@ function gt_rewrite_html_urls($html) {
     }
     unset($part);
 
-    return implode('', $parts);
+    $html = implode('', $parts);
+
+    // Apply Elementor translations to the final HTML
+    global $gt_buffer_post_id;
+    if (!empty($gt_buffer_post_id)) {
+        $html = gt_apply_translations_to_html($html, $gt_buffer_post_id);
+    }
+
+    return $html;
+}
+
+// Apply translations to final HTML output
+function gt_apply_translations_to_html($html, $post_id) {
+    global $wpdb;
+
+    $table_name = $wpdb->prefix . 'gt_translations';
+    $locations_table = $wpdb->prefix . 'gt_string_locations';
+    $target_lang = get_option('gt_target_language');
+
+    // Get translations for this page
+    $translations = $wpdb->get_results($wpdb->prepare(
+        "SELECT t.original_string, t.translated_string
+        FROM $table_name t
+        INNER JOIN $locations_table loc ON t.id = loc.translation_id
+        WHERE loc.source_id = %d
+        AND t.status IN ('translated', 'edited')
+        AND t.language_code = %s",
+        $post_id,
+        $target_lang
+    ));
+
+    if (empty($translations)) {
+        return $html;
+    }
+
+    // Build replacement map with normalized originals
+    $replacement_map = [];
+    foreach ($translations as $t) {
+        if (!empty($t->translated_string) && !empty($t->original_string)) {
+            $normalized = gt_normalize_html($t->original_string);
+            $replacement_map[$normalized] = $t->translated_string;
+        }
+    }
+
+    if (empty($replacement_map)) {
+        return $html;
+    }
+
+    // Normalize HTML and apply replacements
+    $normalized_html = gt_normalize_html($html);
+
+    // Debug output
+    if (isset($_GET['gt_debug']) && current_user_can('manage_options')) {
+        $debug = "\n<!-- GT Output Buffer: Applying " . count($replacement_map) . " translations for post $post_id -->\n";
+        foreach ($replacement_map as $orig => $trans) {
+            $found = strpos($normalized_html, $orig) !== false ? 'FOUND' : 'NOT FOUND';
+            $debug .= "<!-- GT OB: " . esc_html(substr($orig, 0, 60)) . "... = $found -->\n";
+
+            // Extra debug for short items (like titles)
+            if (strlen($orig) < 100) {
+                $debug .= "<!-- GT TITLE DEBUG: Original=[" . esc_html($orig) . "] Translation=[" . esc_html(substr($trans, 0, 50)) . "] -->\n";
+            }
+
+            // Extra debug for long NOT FOUND items
+            if ($found === 'NOT FOUND' && strlen($orig) >= 100) {
+                // Search for the opening tag
+                $search_tag = '<p data-pm-slice';
+                $tag_pos = strpos($normalized_html, $search_tag);
+                if ($tag_pos !== false) {
+                    // Show 300 chars starting from where we found the tag
+                    $context = substr($normalized_html, $tag_pos, 300);
+                    $debug .= "<!-- GT OB DEBUG: Found tag at pos $tag_pos -->\n";
+                    $debug .= "<!-- GT OB DEBUG HTML: " . esc_html($context) . " -->\n";
+
+                    // Show what the original starts with
+                    $orig_start = substr($orig, 0, 300);
+                    $debug .= "<!-- GT OB DEBUG ORIG: " . esc_html($orig_start) . " -->\n";
+                } else {
+                    $debug .= "<!-- GT OB DEBUG: Tag '<p data-pm-slice' NOT FOUND in HTML -->\n";
+                }
+            }
+        }
+        $normalized_html = $debug . $normalized_html;
+    }
+
+    $result = strtr($normalized_html, $replacement_map);
+
+    // Final debug - check if replacement worked
+    if (isset($_GET['gt_debug']) && current_user_can('manage_options')) {
+        $has_translated = strpos($result, 'Términos') !== false ? 'YES' : 'NO';
+        // Check for both literal & and HTML entity &amp;
+        $has_original_raw = strpos($result, 'Terms & Conditions') !== false ? 'YES' : 'NO';
+        $has_original_entity = strpos($result, 'Terms &amp; Conditions') !== false ? 'YES' : 'NO';
+        $result = "<!-- GT FINAL: Has 'Términos': $has_translated, Has 'Terms & Conditions' (raw): $has_original_raw, Has 'Terms &amp;amp; Conditions' (entity): $has_original_entity -->\n" . $result;
+    }
+
+    return $result;
 }
 
 // Prefix the home URL on frontend when translated
@@ -3160,47 +3262,109 @@ add_filter('the_excerpt', 'gt_translate_product_excerpt', 10, 1);
 add_filter('woocommerce_short_description', 'gt_translate_product_excerpt', 10, 1);
 
 // Get cached Elementor translations
-function gt_get_elementor_translations() {
-    static $cached = null;
-    if ($cached !== null) {
-        return $cached;
+function gt_get_elementor_translations($post_id = null) {
+    static $cached = [];
+
+    // Use current post ID if not provided
+    if ($post_id === null) {
+        $post_id = get_the_ID();
+    }
+
+    // Return cached results for this post
+    if (isset($cached[$post_id])) {
+        return $cached[$post_id];
     }
 
     global $wpdb;
     $table_name = $wpdb->prefix . 'gt_translations';
+    $locations_table = $wpdb->prefix . 'gt_string_locations';
     $target_lang = get_option('gt_target_language');
 
-    $cached = $wpdb->get_results($wpdb->prepare(
-        "SELECT original_string, translated_string FROM $table_name
-        WHERE source_type = 'elementor' AND status IN ('translated', 'edited') AND language_code = %s",
+    // Get translations only for this specific page
+    $cached[$post_id] = $wpdb->get_results($wpdb->prepare(
+        "SELECT t.original_string, t.translated_string
+        FROM $table_name t
+        INNER JOIN $locations_table loc ON t.id = loc.translation_id
+        WHERE loc.source_type = 'elementor'
+        AND loc.source_id = %d
+        AND t.status IN ('translated', 'edited')
+        AND t.language_code = %s",
+        $post_id,
         $target_lang
     ));
 
-    return $cached;
+    return $cached[$post_id];
 }
 
 // Apply Elementor translations to content string using strtr for single-pass replacement
-function gt_apply_elementor_translations($content) {
-    static $replacement_map = null;
+// Normalize HTML for consistent matching (XHTML vs HTML5 differences, smart quotes, etc.)
+function gt_normalize_html($html) {
+    // Decode ampersand entities to literal & for consistent matching
+    // This ensures "Terms &amp; Conditions" matches "Terms & Conditions"
+    // We only decode &amp; (and its numeric forms) to avoid breaking HTML structure
+    $html = str_replace(['&amp;', '&#38;', '&#x26;'], '&', $html);
 
-    if ($replacement_map === null) {
-        $replacement_map = [];
-        $translations = gt_get_elementor_translations();
+    // Decode common quote entities
+    $html = str_replace(['&quot;', '&#34;', '&#x22;'], '"', $html);
+    $html = str_replace(['&#39;', '&#x27;', '&apos;'], "'", $html);
+
+    // Decode non-breaking space
+    $html = str_replace(['&nbsp;', '&#160;', '&#xa0;'], ' ', $html);
+
+    // Convert XHTML self-closing tags to HTML5 style: <hr /> -> <hr>, <br /> -> <br>
+    $html = preg_replace('/<(hr|br|img|input|meta|link)(\s[^>]*)?\s*\/>/i', '<$1$2>', $html);
+
+    // Normalize smart/curly quotes to straight quotes
+    // HTML entities for smart quotes
+    $html = str_replace(['&#8220;', '&#8221;', '&#8216;', '&#8217;'], ['"', '"', "'", "'"], $html);
+    // Named entities for smart quotes
+    $html = str_replace(['&ldquo;', '&rdquo;', '&lsquo;', '&rsquo;'], ['"', '"', "'", "'"], $html);
+    // Unicode smart quotes (using chr codes)
+    $html = str_replace(["\xE2\x80\x9C", "\xE2\x80\x9D", "\xE2\x80\x98", "\xE2\x80\x99"], ['"', '"', "'", "'"], $html);
+
+    // Normalize whitespace: collapse multiple spaces/newlines/tabs to single space
+    $html = preg_replace('/\s+/', ' ', $html);
+    // Remove spaces before closing tags
+    $html = preg_replace('/\s+<\//', '</', $html);
+    // Remove spaces after opening tags
+    $html = preg_replace('/>\s+/', '>', $html);
+
+    return $html;
+}
+
+function gt_apply_elementor_translations($content) {
+    static $replacement_maps = [];
+    static $db_counts = [];
+
+    $post_id = get_the_ID();
+
+    if (!isset($replacement_maps[$post_id])) {
+        $replacement_maps[$post_id] = [];
+        $translations = gt_get_elementor_translations($post_id);
+        $db_counts[$post_id] = count($translations);
         foreach ($translations as $t) {
             if (!empty($t->translated_string) && !empty($t->original_string)) {
-                $replacement_map[$t->original_string] = $t->translated_string;
+                // Normalize the original string for matching
+                $normalized_original = gt_normalize_html($t->original_string);
+                $replacement_maps[$post_id][$normalized_original] = $t->translated_string;
             }
         }
     }
 
+    $replacement_map = $replacement_maps[$post_id];
+
     // Debug: add HTML comment showing translation status
     if (isset($_GET['gt_debug']) && current_user_can('manage_options')) {
-        $debug = "\n<!-- GT Debug: " . count($replacement_map) . " translations loaded -->\n";
+        $db_count = $db_counts[$post_id] ?? 0;
+        $debug = "\n<!-- GT Debug: DB returned $db_count rows, map has " . count($replacement_map) . " entries for post $post_id -->\n";
         if (!empty($replacement_map)) {
+            foreach ($replacement_map as $orig => $trans) {
+                $debug .= "<!-- GT Original (" . strlen($orig) . " chars): " . esc_html(substr($orig, 0, 60)) . "... -->\n";
+            }
             $first_original = array_key_first($replacement_map);
-            $debug .= "<!-- GT First original (100 chars): " . esc_html(substr($first_original, 0, 100)) . " -->\n";
-            $debug .= "<!-- GT Content (100 chars): " . esc_html(substr($content, 0, 100)) . " -->\n";
-            $debug .= "<!-- GT Match found: " . (strpos($content, $first_original) !== false ? 'YES' : 'NO') . " -->\n";
+            $normalized_content = gt_normalize_html($content);
+            $debug .= "<!-- GT Content (100 chars): " . esc_html(substr($normalized_content, 0, 100)) . " -->\n";
+            $debug .= "<!-- GT Match found: " . (strpos($normalized_content, $first_original) !== false ? 'YES' : 'NO') . " -->\n";
         }
         $content = $debug . $content;
     }
@@ -3209,7 +3373,9 @@ function gt_apply_elementor_translations($content) {
         return $content;
     }
 
-    return strtr($content, $replacement_map);
+    // Normalize content before matching, then apply replacements
+    $normalized_content = gt_normalize_html($content);
+    return strtr($normalized_content, $replacement_map);
 }
 
 // Filter Elementor widget content
