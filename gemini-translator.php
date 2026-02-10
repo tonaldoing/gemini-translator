@@ -3,7 +3,7 @@
  * Plugin Name: Gemini Translator
  * Plugin URI: https://github.com/tonaldoing/gemini-translator
  * Description: Translate your WooCommerce store using Google Gemini AI
- * Version: 0.3.5
+ * Version: 0.3.6
  * Author: Tomás Vilas for Amrak Solutions
  * Author URI: https://github.com/tonaldoing
  * License: GPL v2 or later
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('GEMINI_TRANSLATOR_VERSION', '0.3.5');
+define('GEMINI_TRANSLATOR_VERSION', '0.3.6');
 define('GEMINI_TRANSLATOR_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('GEMINI_TRANSLATOR_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -3223,6 +3223,23 @@ add_filter('elementor/widget/render_content', 'gt_translate_elementor_widget', 1
 
 // Single the_content filter for all translation (products + Elementor pages)
 function gt_translate_page_content($content) {
+    // Debug at the very start
+    if (isset($_GET['gt_debug']) && current_user_can('manage_options')) {
+        $current_lang = gt_get_current_language();
+        $target_lang = get_option('gt_target_language');
+        $should = gt_should_translate();
+        $is_elementor = defined('ELEMENTOR_VERSION') && \Elementor\Plugin::$instance->documents->get(get_the_ID());
+
+        $debug = "\n<!-- GT Debug START -->\n";
+        $debug .= "<!-- Current lang: $current_lang -->\n";
+        $debug .= "<!-- Target lang: $target_lang -->\n";
+        $debug .= "<!-- Should translate: " . ($should ? 'YES' : 'NO') . " -->\n";
+        $debug .= "<!-- Is Elementor page: " . ($is_elementor ? 'YES' : 'NO') . " -->\n";
+        $debug .= "<!-- Post ID: " . get_the_ID() . " -->\n";
+        $debug .= "<!-- GT Debug END -->\n";
+        $content = $debug . $content;
+    }
+
     if (is_admin() || !gt_should_translate()) {
         return $content;
     }
