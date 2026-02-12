@@ -2814,18 +2814,14 @@ function gt_apply_translations_to_html($html, $post_id) {
     global $wpdb;
 
     $table_name = $wpdb->prefix . 'gt_translations';
-    $locations_table = $wpdb->prefix . 'gt_string_locations';
     $target_lang = get_option('gt_target_language');
 
-    // Get translations for this page
+    // Get ALL translations (not filtered by page) so global elements like footer/header work
     $translations = $wpdb->get_results($wpdb->prepare(
-        "SELECT t.original_string, t.translated_string
-        FROM $table_name t
-        INNER JOIN $locations_table loc ON t.id = loc.translation_id
-        WHERE loc.source_id = %d
-        AND t.status IN ('translated', 'edited')
-        AND t.language_code = %s",
-        $post_id,
+        "SELECT DISTINCT original_string, translated_string
+        FROM $table_name
+        WHERE status IN ('translated', 'edited')
+        AND language_code = %s",
         $target_lang
     ));
 
@@ -2846,53 +2842,56 @@ function gt_apply_translations_to_html($html, $post_id) {
         return $html;
     }
 
-    // Normalize HTML and apply replacements
-    $normalized_html = gt_normalize_html($html);
-
     // Debug output
     if (isset($_GET['gt_debug']) && current_user_can('manage_options')) {
-        $debug = "\n<!-- GT Output Buffer: Applying " . count($replacement_map) . " translations for post $post_id -->\n";
-        foreach ($replacement_map as $orig => $trans) {
-            $found = strpos($normalized_html, $orig) !== false ? 'FOUND' : 'NOT FOUND';
-            $debug .= "<!-- GT OB: " . esc_html(substr($orig, 0, 60)) . "... = $found -->\n";
-
-            // Extra debug for short items (like titles)
-            if (strlen($orig) < 100) {
-                $debug .= "<!-- GT TITLE DEBUG: Original=[" . esc_html($orig) . "] Translation=[" . esc_html(substr($trans, 0, 50)) . "] -->\n";
-            }
-
-            // Extra debug for long NOT FOUND items
-            if ($found === 'NOT FOUND' && strlen($orig) >= 100) {
-                // Search for the opening tag
-                $search_tag = '<p data-pm-slice';
-                $tag_pos = strpos($normalized_html, $search_tag);
-                if ($tag_pos !== false) {
-                    // Show 300 chars starting from where we found the tag
-                    $context = substr($normalized_html, $tag_pos, 300);
-                    $debug .= "<!-- GT OB DEBUG: Found tag at pos $tag_pos -->\n";
-                    $debug .= "<!-- GT OB DEBUG HTML: " . esc_html($context) . " -->\n";
-
-                    // Show what the original starts with
-                    $orig_start = substr($orig, 0, 300);
-                    $debug .= "<!-- GT OB DEBUG ORIG: " . esc_html($orig_start) . " -->\n";
-                } else {
-                    $debug .= "<!-- GT OB DEBUG: Tag '<p data-pm-slice' NOT FOUND in HTML -->\n";
-                }
-            }
-        }
-        $normalized_html = $debug . $normalized_html;
+        $debug = "\n<!-- GT Output Buffer: Applying " . count($replacement_map) . " translations (global, text-only mode) -->\n";
+        $html = $debug . $html;
     }
 
+    // Apply translations only to text content, not inside HTML attributes
+    // This prevents breaking Elementor data-settings JSON and other attribute values
+    $result = gt_replace_text_only($html, $replacement_map);
+
+    return $result;
+}
+
+/**
+ * Replace translations in HTML while protecting data-* attributes (which contain JSON).
+ * This prevents breaking Elementor widgets while still allowing HTML translations.
+ */
+function gt_replace_text_only($html, $replacement_map) {
+    if (empty($replacement_map)) {
+        return $html;
+    }
+
+    // Step 1: Remove editor-specific attributes that shouldn't affect matching
+    // These are internal attributes from editors like ProseMirror that may differ
+    $html = preg_replace('/\s*data-pm-slice="[^"]*"/', '', $html);
+    $html = preg_replace('/\s*data-spread="[^"]*"/', '', $html);
+    $html = preg_replace('/\s*data-path-to-node="[^"]*"/', '', $html);
+
+    // Step 2: Protect remaining data-* attributes (like data-settings JSON) with placeholders
+    $placeholders = [];
+    $counter = 0;
+
+    // Match data-* attributes with their values (handles both single and double quotes)
+    $html = preg_replace_callback(
+        '/\s(data-[a-z0-9_-]+)=(["\'])(.+?)\2/is',
+        function ($matches) use (&$placeholders, &$counter) {
+            $placeholder = "___GT_DATA_PLACEHOLDER_{$counter}___";
+            $placeholders[$placeholder] = " {$matches[1]}={$matches[2]}{$matches[3]}{$matches[2]}";
+            $counter++;
+            return $placeholder;
+        },
+        $html
+    );
+
+    // Step 3: Normalize and apply translations
+    $normalized_html = gt_normalize_html($html);
     $result = strtr($normalized_html, $replacement_map);
 
-    // Final debug - check if replacement worked
-    if (isset($_GET['gt_debug']) && current_user_can('manage_options')) {
-        $has_translated = strpos($result, 'Términos') !== false ? 'YES' : 'NO';
-        // Check for both literal & and HTML entity &amp;
-        $has_original_raw = strpos($result, 'Terms & Conditions') !== false ? 'YES' : 'NO';
-        $has_original_entity = strpos($result, 'Terms &amp; Conditions') !== false ? 'YES' : 'NO';
-        $result = "<!-- GT FINAL: Has 'Términos': $has_translated, Has 'Terms & Conditions' (raw): $has_original_raw, Has 'Terms &amp;amp; Conditions' (entity): $has_original_entity -->\n" . $result;
-    }
+    // Step 4: Restore the protected data-* attributes
+    $result = str_replace(array_keys($placeholders), array_values($placeholders), $result);
 
     return $result;
 }
@@ -3299,6 +3298,12 @@ function gt_get_elementor_translations($post_id = null) {
 // Apply Elementor translations to content string using strtr for single-pass replacement
 // Normalize HTML for consistent matching (XHTML vs HTML5 differences, smart quotes, etc.)
 function gt_normalize_html($html) {
+    // Remove editor-specific attributes that may differ between stored and rendered HTML
+    // These are added by editors like ProseMirror/Notion but may not be in the final render
+    $html = preg_replace('/\s*data-pm-slice="[^"]*"/', '', $html);
+    $html = preg_replace('/\s*data-spread="[^"]*"/', '', $html);
+    $html = preg_replace('/\s*data-path-to-node="[^"]*"/', '', $html);
+
     // Decode ampersand entities to literal & for consistent matching
     // This ensures "Terms &amp; Conditions" matches "Terms & Conditions"
     // We only decode &amp; (and its numeric forms) to avoid breaking HTML structure
@@ -3373,9 +3378,8 @@ function gt_apply_elementor_translations($content) {
         return $content;
     }
 
-    // Normalize content before matching, then apply replacements
-    $normalized_content = gt_normalize_html($content);
-    return strtr($normalized_content, $replacement_map);
+    // Use text-only replacement to avoid breaking HTML attributes (like data-settings JSON)
+    return gt_replace_text_only($content, $replacement_map);
 }
 
 // Filter Elementor widget content
