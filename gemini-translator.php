@@ -3,7 +3,7 @@
  * Plugin Name: Gemini Translator
  * Plugin URI: https://github.com/tonaldoing/gemini-translator
  * Description: Translate your WooCommerce store using Google Gemini AI
- * Version: 0.4.1
+ * Version: 0.4.2
  * Author: Tomás Vilas for Amrak Solutions
  * Author URI: https://github.com/tonaldoing
  * License: GPL v2 or later
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('GEMINI_TRANSLATOR_VERSION', '0.4.1');
+define('GEMINI_TRANSLATOR_VERSION', '0.4.2');
 define('GEMINI_TRANSLATOR_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('GEMINI_TRANSLATOR_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -3479,7 +3479,7 @@ function gt_frontend_switcher_css() {
     }
     <?php endif; ?>
     </style>
-    <script>document.addEventListener('click',function(e){var b=e.target.closest('.gt-lang-btn:not(.active)');if(b){b.classList.add('gt-loading');}var s=e.target.closest('.gt-language-switcher select');if(s){s.style.opacity='0.5';s.style.cursor='wait';}});</script>
+    <script>document.addEventListener('click',function(e){var b=e.target.closest('.gt-lang-btn:not(.active)');if(b){b.classList.add('gt-loading');}var s=e.target.closest('.gt-language-switcher select');if(s){s.style.opacity='0.5';s.style.cursor='wait';}});window.addEventListener('pageshow',function(e){if(e.persisted){document.querySelectorAll('.gt-loading').forEach(function(el){el.classList.remove('gt-loading');});document.querySelectorAll('.gt-language-switcher select').forEach(function(s){s.style.opacity='';s.style.cursor='';});}});</script>
     <?php
 }
 add_action('wp_head', 'gt_frontend_switcher_css');
