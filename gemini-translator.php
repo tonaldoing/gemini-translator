@@ -3,7 +3,7 @@
  * Plugin Name: Gemini Translator
  * Plugin URI: https://github.com/tonaldoing/gemini-translator
  * Description: Translate your WooCommerce store using Google Gemini AI
- * Version: 0.3.7
+ * Version: 0.3.9
  * Author: Tomás Vilas for Amrak Solutions
  * Author URI: https://github.com/tonaldoing
  * License: GPL v2 or later
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('GEMINI_TRANSLATOR_VERSION', '0.3.7');
+define('GEMINI_TRANSLATOR_VERSION', '0.3.9');
 define('GEMINI_TRANSLATOR_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('GEMINI_TRANSLATOR_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -104,7 +104,8 @@ function gt_activate() {
         KEY language_code (language_code),
         KEY status (status),
         KEY source_type (source_type),
-        KEY source_id (source_id)
+        KEY source_id (source_id),
+        KEY idx_lang_status (language_code, status)
     ) $charset_collate;";
     
     $locations_table = $wpdb->prefix . 'gt_string_locations';
@@ -158,6 +159,20 @@ function gt_check_db_upgrade() {
         "INSERT IGNORE INTO $locations_table (translation_id, source_type, source_id)
          SELECT id, source_type, source_id FROM $table_name WHERE source_id IS NOT NULL"
     );
+
+    // Add composite index for performance (language_code + status) if it doesn't exist
+    // This index optimizes the common query pattern: WHERE language_code = X AND status IN (...)
+    $index_exists = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND INDEX_NAME = 'idx_lang_status'",
+            DB_NAME,
+            $table_name
+        )
+    );
+    if (!$index_exists) {
+        $wpdb->query("ALTER TABLE $table_name ADD INDEX idx_lang_status (language_code, status)");
+    }
 
     update_option('gt_db_version', GEMINI_TRANSLATOR_VERSION);
 }
@@ -288,11 +303,17 @@ function gt_sanitize_switcher_style($input) {
 }
 
 function gt_get_switcher_style() {
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
     $style = get_option('gt_switcher_style');
     if (!is_array($style)) {
-        return gt_get_default_switcher_style();
+        $cached = gt_get_default_switcher_style();
+        return $cached;
     }
-    return array_merge(gt_get_default_switcher_style(), $style);
+    $cached = array_merge(gt_get_default_switcher_style(), $style);
+    return $cached;
 }
 
 function gt_get_available_fonts() {
@@ -379,6 +400,18 @@ function gt_get_source_language() {
         return gt_get_wp_language();
     }
     return $source;
+}
+
+// Get target language with static cache (resolved once per request)
+function gt_get_target_language() {
+    static $lang = null;
+    if ($lang === null) {
+        $lang = get_option('gt_target_language');
+        if (empty($lang)) {
+            $lang = '';
+        }
+    }
+    return $lang;
 }
 
 // Get all available languages
@@ -561,6 +594,37 @@ function gt_extract_elementor_strings($elements, $post_id, $strings = []) {
                             'text' => $val,
                             'context' => 'elementor_' . $key,
                         ];
+                    }
+                }
+            }
+
+            // Extract text from HTML elements inside 'editor' field (for HTML widgets)
+            if (isset($settings['editor']) && is_string($settings['editor'])) {
+                $html_content = $settings['editor'];
+
+                // Extract text from <button> elements
+                if (preg_match_all('/<button[^>]*>([^<]+)<\/button>/i', $html_content, $matches)) {
+                    foreach ($matches[1] as $button_text) {
+                        $val = trim($button_text);
+                        if ($val !== '' && gt_is_translatable_value($val, $skip_values)) {
+                            $strings[] = [
+                                'text' => $val,
+                                'context' => 'elementor_html_button',
+                            ];
+                        }
+                    }
+                }
+
+                // Extract text from <option> elements
+                if (preg_match_all('/<option[^>]*>([^<]+)<\/option>/i', $html_content, $matches)) {
+                    foreach ($matches[1] as $option_text) {
+                        $val = trim($option_text);
+                        if ($val !== '' && gt_is_translatable_value($val, $skip_values)) {
+                            $strings[] = [
+                                'text' => $val,
+                                'context' => 'elementor_html_option',
+                            ];
+                        }
                     }
                 }
             }
@@ -910,44 +974,179 @@ function gt_translate_with_gemini($text, $target_language) {
     return ['success' => false, 'error' => 'Invalid response format from API'];
 }
 
+// Call Gemini API with multiple strings in a single request
+function gt_translate_batch_with_gemini($texts, $target_language) {
+    $api_key = get_option('gt_api_key');
+
+    if (empty($api_key)) {
+        return ['success' => false, 'error' => 'API key not configured'];
+    }
+
+    $language_names = [
+        'en' => 'English',
+        'es' => 'Spanish',
+        'pt' => 'Portuguese',
+        'fr' => 'French',
+        'de' => 'German',
+        'it' => 'Italian',
+        'nl' => 'Dutch',
+        'pl' => 'Polish',
+        'ru' => 'Russian',
+        'zh' => 'Chinese',
+        'ja' => 'Japanese',
+        'ko' => 'Korean',
+        'ar' => 'Arabic',
+    ];
+
+    $lang_name = $language_names[$target_language] ?? $target_language;
+    $count = count($texts);
+    $json_input = json_encode(array_values($texts), JSON_UNESCAPED_UNICODE);
+
+    $prompt = "Translate each text in the following JSON array to {$lang_name}. "
+            . "Return a JSON array with exactly {$count} translations in the same order. "
+            . "Preserve any HTML tags exactly as they are.\n\n"
+            . $json_input;
+
+    $response = wp_remote_post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        [
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'x-goog-api-key' => $api_key,
+            ],
+            'body' => json_encode([
+                'contents' => [
+                    ['parts' => [['text' => $prompt]]]
+                ],
+                'generationConfig' => [
+                    'responseMimeType' => 'application/json',
+                ],
+            ]),
+            'timeout' => 120,
+        ]
+    );
+
+    if (is_wp_error($response)) {
+        return ['success' => false, 'error' => 'Connection failed: ' . $response->get_error_message()];
+    }
+
+    $code = wp_remote_retrieve_response_code($response);
+    $body = json_decode(wp_remote_retrieve_body($response), true);
+
+    if ($code !== 200) {
+        $error_msg = $body['error']['message'] ?? "HTTP error $code";
+        return ['success' => false, 'error' => $error_msg];
+    }
+
+    if (!isset($body['candidates'][0]['content']['parts'][0]['text'])) {
+        return ['success' => false, 'error' => 'Invalid response format from API'];
+    }
+
+    $raw_text = $body['candidates'][0]['content']['parts'][0]['text'];
+    $translations = json_decode($raw_text, true);
+
+    if (!is_array($translations)) {
+        return ['success' => false, 'error' => 'Failed to parse translations JSON'];
+    }
+
+    $result = ['success' => true, 'translations' => $translations];
+
+    if (count($translations) < $count) {
+        $result['partial'] = true;
+    }
+
+    return $result;
+}
+
 // Translate pending strings (batch)
-function gt_translate_batch($limit = 10) {
+function gt_translate_batch($limit = 25) {
     global $wpdb;
-    
+
     $table_name = $wpdb->prefix . 'gt_translations';
     $language = get_option('gt_target_language');
-    
+
     $pending = $wpdb->get_results($wpdb->prepare(
         "SELECT * FROM $table_name WHERE status = 'pending' AND language_code = %s LIMIT %d",
         $language,
         $limit
     ));
-    
+
+    if (empty($pending)) {
+        return ['translated' => 0, 'errors' => []];
+    }
+
+    // Prepare texts for batch translation
+    $texts = [];
+    foreach ($pending as $item) {
+        $texts[] = $item->original_string;
+    }
+
+    // Attempt batch translation
+    $result = gt_translate_batch_with_gemini($texts, $language);
+
     $translated = 0;
     $errors = [];
-    
-    foreach ($pending as $item) {
-        $result = gt_translate_with_gemini($item->original_string, $language);
-        
-        if (!$result['success']) {
-            $errors[] = $result['error'];
-            continue;
+
+    if ($result['success'] && !empty($result['translations'])) {
+        // Apply translations by position
+        foreach ($result['translations'] as $i => $translation) {
+            if (!isset($pending[$i])) break;
+            if (empty($translation)) continue; // skip empty translations, leave as pending
+
+            $wpdb->update(
+                $table_name,
+                [
+                    'translated_string' => $translation,
+                    'status' => 'translated',
+                ],
+                ['id' => $pending[$i]->id]
+            );
+            $translated++;
         }
-        
-        $wpdb->update(
-            $table_name,
-            [
-                'translated_string' => $result['translation'],
-                'status' => 'translated',
-            ],
-            ['id' => $item->id]
-        );
-        
-        $translated++;
-        
-        usleep(500000);
+
+        // If count mismatch, translate the rest individually
+        if (count($result['translations']) < count($pending)) {
+            $remaining_items = array_slice($pending, count($result['translations']));
+            foreach ($remaining_items as $item) {
+                $individual = gt_translate_with_gemini($item->original_string, $language);
+                if ($individual['success']) {
+                    $wpdb->update(
+                        $table_name,
+                        [
+                            'translated_string' => $individual['translation'],
+                            'status' => 'translated',
+                        ],
+                        ['id' => $item->id]
+                    );
+                    $translated++;
+                } else {
+                    $errors[] = $individual['error'];
+                }
+                usleep(500000);
+            }
+        }
+    } else {
+        // Batch failed — fallback to individual translation
+        $errors[] = 'Batch failed: ' . ($result['error'] ?? 'unknown') . '. Falling back to individual.';
+        foreach ($pending as $item) {
+            $individual = gt_translate_with_gemini($item->original_string, $language);
+            if ($individual['success']) {
+                $wpdb->update(
+                    $table_name,
+                    [
+                        'translated_string' => $individual['translation'],
+                        'status' => 'translated',
+                    ],
+                    ['id' => $item->id]
+                );
+                $translated++;
+            } else {
+                $errors[] = $individual['error'];
+            }
+            usleep(500000);
+        }
     }
-    
+
     return ['translated' => $translated, 'errors' => $errors];
 }
 
@@ -969,6 +1168,11 @@ function gt_ajax_translate_batch() {
         "SELECT COUNT(*) FROM $table_name WHERE status = 'pending' AND language_code = %s",
         $language
     ));
+
+    // Invalidate translation cache after batch translation
+    if ($result['translated'] > 0) {
+        gt_invalidate_translation_cache();
+    }
 
     wp_send_json_success([
         'translated' => $result['translated'],
@@ -1074,6 +1278,9 @@ function gt_ajax_save_translation() {
     if ($result === false) {
         wp_send_json_error(['message' => 'Database update failed.']);
     }
+
+    // Invalidate translation cache so changes appear immediately
+    gt_invalidate_translation_cache();
 
     wp_send_json_success([
         'status' => 'edited',
@@ -2413,7 +2620,9 @@ class GT_GitHub_Updater {
 function gt_init_updater() {
     new GT_GitHub_Updater(__FILE__, 'tonaldoing/gemini-translator');
 }
-add_action('init', 'gt_init_updater');
+if (is_admin() || wp_doing_cron()) {
+    add_action('init', 'gt_init_updater');
+}
 
 // AJAX handler for force update check
 function gt_ajax_check_updates() {
@@ -2455,7 +2664,7 @@ add_action('wp_ajax_gt_check_updates', 'gt_ajax_check_updates');
 // Detect language prefix from the current URL
 function gt_get_language_from_url() {
     $request_uri = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '';
-    $target_lang = get_option('gt_target_language');
+    $target_lang = gt_get_target_language();
 
     if (!empty($target_lang) && preg_match('#^/' . preg_quote($target_lang, '#') . '(/|$)#', $request_uri)) {
         return $target_lang;
@@ -2464,30 +2673,43 @@ function gt_get_language_from_url() {
     return '';
 }
 
-// Get current language from URL prefix, then cookie, then default
+// Get current language from URL prefix, then cookie, then default (cached per request)
 function gt_get_current_language() {
+    static $lang = null;
+    if ($lang !== null) {
+        return $lang;
+    }
+
     $from_url = gt_get_language_from_url();
     if (!empty($from_url)) {
-        return $from_url;
+        $lang = $from_url;
+        return $lang;
     }
 
     if (isset($_COOKIE['gt_language'])) {
-        return sanitize_text_field($_COOKIE['gt_language']);
+        $lang = sanitize_text_field($_COOKIE['gt_language']);
+        return $lang;
     }
 
-    return gt_get_source_language();
+    $lang = gt_get_source_language();
+    return $lang;
 }
 
-// Check if we should show translations
+// Check if we should show translations (cached per request)
 function gt_should_translate() {
+    static $result = null;
+    if ($result !== null) {
+        return $result;
+    }
     $current = gt_get_current_language();
-    $target = get_option('gt_target_language');
-    return ($current === $target);
+    $target = gt_get_target_language();
+    $result = ($current === $target);
+    return $result;
 }
 
 // Add rewrite rules for /{lang}/ prefix
 function gt_add_rewrite_rules() {
-    $target_lang = get_option('gt_target_language');
+    $target_lang = gt_get_target_language();
     if (empty($target_lang)) {
         return;
     }
@@ -2611,7 +2833,7 @@ function gt_prefix_permalink($url, $post = null) {
         return $url;
     }
 
-    $target_lang = get_option('gt_target_language');
+    $target_lang = gt_get_target_language();
     $home_url = home_url('/');
     $prefix = home_url('/' . $target_lang . '/');
 
@@ -2640,7 +2862,7 @@ function gt_prefix_nav_menu_link($atts, $item, $args, $depth) {
         return $atts;
     }
 
-    $target_lang = get_option('gt_target_language');
+    $target_lang = gt_get_target_language();
     $home_url = home_url('/');
     $prefix = home_url('/' . $target_lang . '/');
 
@@ -2690,14 +2912,21 @@ function gt_start_url_rewrite_buffer() {
 }
 add_action('template_redirect', 'gt_start_url_rewrite_buffer', 1);
 
-function gt_rewrite_html_urls($html) {
-    if (empty($html)) {
-        return $html;
+/**
+ * Get pre-compiled regex patterns for URL rewriting.
+ * Patterns are cached in a static variable to avoid rebuilding on every call.
+ */
+function gt_get_url_rewrite_config() {
+    static $config = null;
+
+    if ($config !== null) {
+        return $config;
     }
 
-    $target_lang = get_option('gt_target_language');
+    $target_lang = gt_get_target_language();
     if (empty($target_lang)) {
-        return $html;
+        $config = ['enabled' => false];
+        return $config;
     }
 
     // Build home URL without the language prefix filter interfering
@@ -2707,6 +2936,45 @@ function gt_rewrite_html_urls($html) {
 
     $prefix = $home_url . $target_lang . '/';
     $escaped_home = preg_quote($home_url, '#');
+    $escaped_lang = preg_quote($target_lang, '#');
+
+    // Pre-compiled patterns (built once, used many times)
+    $config = [
+        'enabled' => true,
+        'target_lang' => $target_lang,
+        'home_url' => $home_url,
+        'prefix' => $prefix,
+        'patterns' => [
+            // Combined: href/data-href/data-link attributes + Elementor JSON "url" fields (single pass)
+            'all_urls' => '#((?:href|data-(?:href|link))=["\']|"url"\s*:\s*")(' . $escaped_home . '|/(?!/))([^"\']*["\'])#i',
+        ],
+        // Pre-compiled skip patterns (also cached)
+        'skip_wp_paths' => '#^(wp-admin|wp-content|wp-includes|wp-json|wp-login)#',
+        'already_prefixed' => '#^' . $escaped_lang . '/#',
+    ];
+
+    return $config;
+}
+
+function gt_rewrite_html_urls($html) {
+    $gt_debug = defined('WP_DEBUG') && WP_DEBUG;
+    if ($gt_debug) {
+        $t_total_start = microtime(true);
+    }
+
+    if (empty($html)) {
+        return $html;
+    }
+
+    // Get pre-compiled config (cached)
+    $config = gt_get_url_rewrite_config();
+    if (!$config['enabled']) {
+        return $html;
+    }
+
+    $target_lang = $config['target_lang'];
+    $prefix = $config['prefix'];
+    $patterns = $config['patterns'];
 
     // Split HTML on gt-no-rewrite markers, only rewrite the unprotected parts
     $parts = preg_split('#(<!-- gt-no-rewrite -->.*?<!-- /gt-no-rewrite -->)#s', $html, -1, PREG_SPLIT_DELIM_CAPTURE);
@@ -2717,81 +2985,33 @@ function gt_rewrite_html_urls($html) {
             continue;
         }
 
-        // Rewrite href="..." pointing to absolute internal URLs
+        // Rewrite all URLs in a single pass: href/data-href/data-link attributes + Elementor JSON "url" fields
         $part = preg_replace_callback(
-            '#(href=["\'])(' . $escaped_home . ')([^"\']*["\'])#i',
-            function ($m) use ($home_url, $prefix, $target_lang) {
+            $patterns['all_urls'],
+            function ($m) use ($prefix, $target_lang, $config) {
+                $url_start = $m[2];
                 $path = $m[3];
-                // Skip if already prefixed
-                if (strpos($m[2] . $path, $prefix) === 0) {
-                    return $m[0];
-                }
-                // Skip admin, wp-content, wp-includes, wp-json URLs
-                if (preg_match('#^(wp-admin|wp-content|wp-includes|wp-json|wp-login)#', $path)) {
-                    return $m[0];
-                }
-                return $m[1] . $prefix . $path;
-            },
-            $part
-        );
+                $is_attr = ($m[1][0] !== '"'); // JSON "url" starts with quote, attr starts with letter
 
-        // Rewrite href="/" relative URLs (but not // protocol-relative)
-        $part = preg_replace_callback(
-            '#(href=["\'])(/(?!/))([^"\']*["\'])#i',
-            function ($m) use ($target_lang) {
-                $path = $m[3];
-                // Skip if already prefixed with language
-                if (preg_match('#^' . preg_quote($target_lang, '#') . '/#', ltrim($m[2] . $path, '/'))) {
-                    return $m[0];
+                if ($url_start === '/') {
+                    // Relative URL
+                    if ($is_attr && preg_match($config['already_prefixed'], ltrim($url_start . $path, '/'))) {
+                        return $m[0];
+                    }
+                    if (preg_match($config['skip_wp_paths'], ltrim($path, '/'))) {
+                        return $m[0];
+                    }
+                    return $m[1] . '/' . $target_lang . $url_start . $path;
+                } else {
+                    // Absolute URL
+                    if ($is_attr && strpos($url_start . $path, $prefix) === 0) {
+                        return $m[0];
+                    }
+                    if ($is_attr && preg_match($config['skip_wp_paths'], $path)) {
+                        return $m[0];
+                    }
+                    return $m[1] . $prefix . $path;
                 }
-                // Skip admin, wp-content, wp-includes, wp-json URLs
-                if (preg_match('#^/(wp-admin|wp-content|wp-includes|wp-json|wp-login)#', $m[2])) {
-                    return $m[0];
-                }
-                return $m[1] . '/' . $target_lang . $m[2] . $path;
-            },
-            $part
-        );
-
-        // Rewrite data-href and data-link attributes (used by some Elementor widgets)
-        $part = preg_replace_callback(
-            '#(data-(?:href|link)=["\'])(' . $escaped_home . ')([^"\']*["\'])#i',
-            function ($m) use ($prefix) {
-                return $m[1] . $prefix . $m[3];
-            },
-            $part
-        );
-
-        // Rewrite relative URLs in data-href and data-link
-        $part = preg_replace_callback(
-            '#(data-(?:href|link)=["\'])(/(?!/))([^"\']*["\'])#i',
-            function ($m) use ($target_lang) {
-                $path = $m[3];
-                if (preg_match('#^' . preg_quote($target_lang, '#') . '/#', ltrim($m[2] . $path, '/'))) {
-                    return $m[0];
-                }
-                if (preg_match('#^/(wp-admin|wp-content|wp-includes|wp-json|wp-login)#', $m[2])) {
-                    return $m[0];
-                }
-                return $m[1] . '/' . $target_lang . $m[2] . $path;
-            },
-            $part
-        );
-
-        // Rewrite URLs inside Elementor data-settings JSON (common pattern: "url":"...")
-        $part = preg_replace_callback(
-            '#("url"\s*:\s*")(' . $escaped_home . ')([^"]*")#i',
-            function ($m) use ($prefix) {
-                return $m[1] . $prefix . $m[3];
-            },
-            $part
-        );
-
-        // Rewrite relative URLs in data-settings JSON
-        $part = preg_replace_callback(
-            '#("url"\s*:\s*")(/(?!/|wp-admin|wp-content|wp-includes|wp-json|wp-login))([^"]*")#i',
-            function ($m) use ($target_lang) {
-                return $m[1] . '/' . $target_lang . $m[2] . $m[3];
             },
             $part
         );
@@ -2806,37 +3026,27 @@ function gt_rewrite_html_urls($html) {
         $html = gt_apply_translations_to_html($html, $gt_buffer_post_id);
     }
 
+    if ($gt_debug) {
+        $t_total_end = microtime(true);
+        $html_kb = round(strlen($html) / 1024, 1);
+        error_log(sprintf('[GT Performance] OB callback total: %.4fs (HTML size: %sKB)', $t_total_end - $t_total_start, $html_kb));
+    }
+
     return $html;
 }
 
-// Apply translations to final HTML output
+// Apply translations to final HTML output (uses persistent cache - no DB query)
 function gt_apply_translations_to_html($html, $post_id) {
-    global $wpdb;
-
-    $table_name = $wpdb->prefix . 'gt_translations';
-    $target_lang = get_option('gt_target_language');
-
-    // Get ALL translations (not filtered by page) so global elements like footer/header work
-    $translations = $wpdb->get_results($wpdb->prepare(
-        "SELECT DISTINCT original_string, translated_string
-        FROM $table_name
-        WHERE status IN ('translated', 'edited')
-        AND language_code = %s",
-        $target_lang
-    ));
-
-    if (empty($translations)) {
-        return $html;
+    // Debug: allow cache clear via URL parameter
+    if (isset($_GET['gt_clear_cache']) && current_user_can('manage_options')) {
+        gt_invalidate_translation_cache();
     }
 
-    // Build replacement map with normalized originals
-    $replacement_map = [];
-    foreach ($translations as $t) {
-        if (!empty($t->translated_string) && !empty($t->original_string)) {
-            $normalized = gt_normalize_html($t->original_string);
-            $replacement_map[$normalized] = $t->translated_string;
-        }
-    }
+    // Use the persistent cache instead of querying the database
+    $cache = gt_load_translation_cache();
+
+    // Get the pre-built replacement map from cache
+    $replacement_map = isset($cache['by_original']) ? $cache['by_original'] : [];
 
     if (empty($replacement_map)) {
         return $html;
@@ -2844,7 +3054,66 @@ function gt_apply_translations_to_html($html, $post_id) {
 
     // Debug output
     if (isset($_GET['gt_debug']) && current_user_can('manage_options')) {
-        $debug = "\n<!-- GT Output Buffer: Applying " . count($replacement_map) . " translations (global, text-only mode) -->\n";
+        $debug = "\n<!-- GT Output Buffer: Applying " . count($replacement_map) . " translations (global, text-only mode, cached) -->\n";
+
+        // Show search parameter if provided
+        if (isset($_GET['gt_search'])) {
+            $search = sanitize_text_field($_GET['gt_search']);
+            $debug .= "<!-- GT Search: Looking for '$search' -->\n";
+            $found_in_map = false;
+
+            // Check if search term exists in any original string in the map
+            $match_count = 0;
+            foreach ($replacement_map as $orig => $trans) {
+                if (stripos($orig, $search) !== false) {
+                    $match_count++;
+                    $debug .= "<!-- GT Match #$match_count -->\n";
+                    $debug .= "<!-- GT Original (map key): " . esc_html(substr($orig, 0, 200)) . " -->\n";
+                    $debug .= "<!-- GT Translates to: " . esc_html(substr($trans, 0, 200)) . " -->\n";
+                    $found_in_map = true;
+                }
+            }
+            if ($match_count > 0) {
+                $debug .= "<!-- GT Total matches in map: $match_count -->\n";
+            }
+            if (!$found_in_map) {
+                $debug .= "<!-- GT NOT found in translation map! Check DB status/language_code -->\n";
+
+                // Query DB directly to help diagnose
+                global $wpdb;
+                $table = $wpdb->prefix . 'gt_translations';
+                $like_search = '%' . $wpdb->esc_like($search) . '%';
+                $db_rows = $wpdb->get_results($wpdb->prepare(
+                    "SELECT id, original_string, status, language_code FROM $table WHERE original_string LIKE %s LIMIT 5",
+                    $like_search
+                ));
+                if ($db_rows) {
+                    foreach ($db_rows as $row) {
+                        $debug .= "<!-- GT DB row id={$row->id} status={$row->status} lang={$row->language_code} -->\n";
+                        $debug .= "<!-- GT DB original: " . esc_html(substr($row->original_string, 0, 150)) . " -->\n";
+                        $normalized_db = gt_normalize_html($row->original_string);
+                        $debug .= "<!-- GT DB normalized: " . esc_html(substr($normalized_db, 0, 150)) . " -->\n";
+                    }
+                } else {
+                    $debug .= "<!-- GT DB: No rows found matching '$search' -->\n";
+                }
+            }
+
+            // Check if search term exists in HTML (before and after normalization)
+            $debug .= "<!-- GT Raw HTML contains '$search': " . (stripos($html, $search) !== false ? 'YES' : 'NO') . " -->\n";
+            $normalized_html = gt_normalize_html($html);
+            if (stripos($normalized_html, $search) !== false) {
+                $debug .= "<!-- GT Normalized HTML contains '$search': YES -->\n";
+                // Show context around the match
+                $pos = stripos($normalized_html, $search);
+                $start = max(0, $pos - 30);
+                $context = substr($normalized_html, $start, strlen($search) + 80);
+                $debug .= "<!-- GT HTML context: " . esc_html($context) . " -->\n";
+            } else {
+                $debug .= "<!-- GT Normalized HTML contains '$search': NO -->\n";
+            }
+        }
+
         $html = $debug . $html;
     }
 
@@ -2864,20 +3133,21 @@ function gt_replace_text_only($html, $replacement_map) {
         return $html;
     }
 
-    // Step 1: Remove editor-specific attributes that shouldn't affect matching
-    // These are internal attributes from editors like ProseMirror that may differ
-    $html = preg_replace('/\s*data-pm-slice="[^"]*"/', '', $html);
-    $html = preg_replace('/\s*data-spread="[^"]*"/', '', $html);
-    $html = preg_replace('/\s*data-path-to-node="[^"]*"/', '', $html);
+    $gt_debug = defined('WP_DEBUG') && WP_DEBUG;
+    if ($gt_debug) {
+        $t_start = microtime(true);
+    }
 
-    // Step 2: Protect remaining data-* attributes (like data-settings JSON) with placeholders
+    // Protect data-* attributes with placeholders, removing editor-specific ones entirely.
     $placeholders = [];
     $counter = 0;
 
-    // Match data-* attributes with their values (handles both single and double quotes)
     $html = preg_replace_callback(
         '/\s(data-[a-z0-9_-]+)=(["\'])(.+?)\2/is',
         function ($matches) use (&$placeholders, &$counter) {
+            if ($matches[1] === 'data-pm-slice' || $matches[1] === 'data-spread' || $matches[1] === 'data-path-to-node') {
+                return '';
+            }
             $placeholder = "___GT_DATA_PLACEHOLDER_{$counter}___";
             $placeholders[$placeholder] = " {$matches[1]}={$matches[2]}{$matches[3]}{$matches[2]}";
             $counter++;
@@ -2886,12 +3156,28 @@ function gt_replace_text_only($html, $replacement_map) {
         $html
     );
 
-    // Step 3: Normalize and apply translations
+    if ($gt_debug) {
+        $t_after_protect = microtime(true);
+    }
+
     $normalized_html = gt_normalize_html($html);
     $result = strtr($normalized_html, $replacement_map);
 
-    // Step 4: Restore the protected data-* attributes
+    // Restore the protected data-* attributes
     $result = str_replace(array_keys($placeholders), array_values($placeholders), $result);
+
+    if ($gt_debug) {
+        $t_end = microtime(true);
+        error_log(sprintf(
+            '[GT Performance] gt_replace_text_only: %.4fs total (protect: %.4fs, rest: %.4fs | %d translations, %d placeholders, HTML size: %sKB)',
+            $t_end - $t_start,
+            $t_after_protect - $t_start,
+            $t_end - $t_after_protect,
+            count($replacement_map),
+            $counter,
+            round(strlen($result) / 1024, 1)
+        ));
+    }
 
     return $result;
 }
@@ -2904,7 +3190,7 @@ function gt_prefix_home_url($url, $path) {
         return $url;
     }
 
-    $target_lang = get_option('gt_target_language');
+    $target_lang = gt_get_target_language();
 
     // Avoid double-prefixing and only affect root/empty paths
     if (!empty($path) && $path !== '/') {
@@ -2936,29 +3222,103 @@ function gt_flush_rewrite_rules() {
 register_activation_hook(__FILE__, 'gt_flush_rewrite_rules');
 register_deactivation_hook(__FILE__, 'flush_rewrite_rules');
 
-// Load all translations into a static cache (called once per request)
-function gt_load_translation_cache() {
+// Load all translations into a persistent cache (with transients/object cache)
+function gt_load_translation_cache($reset = false) {
     static $cache = null;
+    if ($reset) {
+        $cache = null;
+        return null;
+    }
     if ($cache !== null) {
         return $cache;
     }
 
+    $gt_debug = defined('WP_DEBUG') && WP_DEBUG;
+    if ($gt_debug) {
+        $t_start = microtime(true);
+    }
+
+    $target_lang = gt_get_target_language();
+    if (empty($target_lang)) {
+        $cache = ['by_hash' => [], 'by_original' => []];
+        return $cache;
+    }
+
+    $cache_key = 'gt_translations_' . $target_lang;
+
+    // Try object cache first (Redis/Memcached if available)
+    $cache = wp_cache_get($cache_key, 'gt_translations');
+    if ($cache !== false && is_array($cache) && isset($cache['by_hash'])) {
+        if ($gt_debug) {
+            error_log(sprintf('[GT Performance] gt_load_translation_cache: %.4fs (%d translations, source: object_cache)', microtime(true) - $t_start, count($cache['by_original'])));
+        }
+        return $cache;
+    }
+
+    // Fallback to transient
+    $cache = get_transient($cache_key);
+    if ($cache !== false && is_array($cache) && isset($cache['by_hash'])) {
+        wp_cache_set($cache_key, $cache, 'gt_translations', HOUR_IN_SECONDS);
+        if ($gt_debug) {
+            error_log(sprintf('[GT Performance] gt_load_translation_cache: %.4fs (%d translations, source: transient)', microtime(true) - $t_start, count($cache['by_original'])));
+        }
+        return $cache;
+    }
+
+    // Query database
     global $wpdb;
     $table_name = $wpdb->prefix . 'gt_translations';
-    $target_lang = get_option('gt_target_language');
 
     $results = $wpdb->get_results($wpdb->prepare(
-        "SELECT string_hash, translated_string FROM $table_name
+        "SELECT string_hash, original_string, translated_string FROM $table_name
         WHERE language_code = %s AND status IN ('translated', 'edited') AND translated_string IS NOT NULL",
         $target_lang
     ));
 
-    $cache = [];
+    $cache = [
+        'by_hash' => [],
+        'by_original' => [],
+    ];
+
     foreach ($results as $row) {
-        $cache[$row->string_hash] = $row->translated_string;
+        $cache['by_hash'][$row->string_hash] = $row->translated_string;
+        if (!empty($row->original_string)) {
+            $normalized = gt_normalize_html($row->original_string);
+            $cache['by_original'][$normalized] = $row->translated_string;
+        }
     }
 
+    if ($gt_debug) {
+        error_log(sprintf('[GT Performance] gt_load_translation_cache: %.4fs (%d translations, source: database)', microtime(true) - $t_start, count($cache['by_original'])));
+    }
+
+    // Cache for 1 hour
+    wp_cache_set($cache_key, $cache, 'gt_translations', HOUR_IN_SECONDS);
+    set_transient($cache_key, $cache, HOUR_IN_SECONDS);
+
     return $cache;
+}
+
+/**
+ * Invalidate the translation cache when translations are modified.
+ * Called after saving, editing, or batch translating.
+ */
+function gt_invalidate_translation_cache() {
+    $target_lang = get_option('gt_target_language');
+    if (empty($target_lang)) {
+        return;
+    }
+
+    $cache_key = 'gt_translations_' . $target_lang;
+
+    // Clear object cache
+    wp_cache_delete($cache_key, 'gt_translations');
+
+    // Clear transient
+    delete_transient($cache_key);
+
+    // Reset static cache for current request
+    gt_load_translation_cache(true);
 }
 
 // Get translation for a string
@@ -2970,7 +3330,12 @@ function gt_get_translation($original_string) {
     $cache = gt_load_translation_cache();
     $string_hash = hash('sha256', $original_string);
 
-    return isset($cache[$string_hash]) ? $cache[$string_hash] : $original_string;
+    // Use the 'by_hash' sub-array from the new cache structure
+    if (isset($cache['by_hash'][$string_hash])) {
+        return $cache['by_hash'][$string_hash];
+    }
+
+    return $original_string;
 }
 
 // Output frontend switcher CSS
@@ -3064,7 +3429,7 @@ function gt_frontend_link_interceptor() {
         return;
     }
 
-    $target_lang = get_option('gt_target_language');
+    $target_lang = gt_get_target_language();
     if (empty($target_lang)) {
         return;
     }
@@ -3176,7 +3541,7 @@ function gt_language_switcher_shortcode($atts) {
 
     $current_lang = gt_get_current_language();
     $source_lang = gt_get_source_language();
-    $target_lang = get_option('gt_target_language');
+    $target_lang = gt_get_target_language();
     $languages = gt_get_available_languages();
     $s = gt_get_switcher_style();
 
@@ -3238,192 +3603,42 @@ function gt_language_switcher_shortcode($atts) {
 }
 add_shortcode('gt_language_switcher', 'gt_language_switcher_shortcode');
 
-// Filter WooCommerce product title — only when translating, skip admin
-function gt_translate_product_title($title, $id) {
-    if (is_admin() || !gt_should_translate()) {
-        return $title;
-    }
-    return gt_get_translation($title);
-}
-add_filter('the_title', 'gt_translate_product_title', 10, 2);
+// NOTE: Translation processing has been consolidated to the output buffer (gt_apply_translations_to_html)
+// The following content filters have been removed to eliminate redundant processing:
+// - gt_translate_product_title (was filtering the_title)
+// - gt_translate_product_excerpt (was filtering the_excerpt, woocommerce_short_description)
+// - gt_translate_elementor_widget (was filtering elementor/widget/render_content)
+// - gt_translate_page_content (was filtering the_content)
+// - gt_get_elementor_translations (was querying DB for page-specific translations)
+// - gt_apply_elementor_translations (was applying translations to content)
+// All translations are now applied once via the output buffer for better performance.
 
-// Filter WooCommerce product short description
-function gt_translate_product_excerpt($excerpt) {
-    if (is_admin() || !gt_should_translate()) {
-        return $excerpt;
-    }
-    if (is_product() || is_shop() || is_product_category()) {
-        return gt_get_translation($excerpt);
-    }
-    return $excerpt;
-}
-add_filter('the_excerpt', 'gt_translate_product_excerpt', 10, 1);
-add_filter('woocommerce_short_description', 'gt_translate_product_excerpt', 10, 1);
-
-// Get cached Elementor translations
-function gt_get_elementor_translations($post_id = null) {
-    static $cached = [];
-
-    // Use current post ID if not provided
-    if ($post_id === null) {
-        $post_id = get_the_ID();
-    }
-
-    // Return cached results for this post
-    if (isset($cached[$post_id])) {
-        return $cached[$post_id];
-    }
-
-    global $wpdb;
-    $table_name = $wpdb->prefix . 'gt_translations';
-    $locations_table = $wpdb->prefix . 'gt_string_locations';
-    $target_lang = get_option('gt_target_language');
-
-    // Get translations only for this specific page
-    $cached[$post_id] = $wpdb->get_results($wpdb->prepare(
-        "SELECT t.original_string, t.translated_string
-        FROM $table_name t
-        INNER JOIN $locations_table loc ON t.id = loc.translation_id
-        WHERE loc.source_type = 'elementor'
-        AND loc.source_id = %d
-        AND t.status IN ('translated', 'edited')
-        AND t.language_code = %s",
-        $post_id,
-        $target_lang
-    ));
-
-    return $cached[$post_id];
-}
-
-// Apply Elementor translations to content string using strtr for single-pass replacement
 // Normalize HTML for consistent matching (XHTML vs HTML5 differences, smart quotes, etc.)
 function gt_normalize_html($html) {
-    // Remove editor-specific attributes that may differ between stored and rendered HTML
-    // These are added by editors like ProseMirror/Notion but may not be in the final render
-    $html = preg_replace('/\s*data-pm-slice="[^"]*"/', '', $html);
-    $html = preg_replace('/\s*data-spread="[^"]*"/', '', $html);
-    $html = preg_replace('/\s*data-path-to-node="[^"]*"/', '', $html);
-
-    // Decode ampersand entities to literal & for consistent matching
-    // This ensures "Terms &amp; Conditions" matches "Terms & Conditions"
-    // We only decode &amp; (and its numeric forms) to avoid breaking HTML structure
-    $html = str_replace(['&amp;', '&#38;', '&#x26;'], '&', $html);
-
-    // Decode common quote entities
-    $html = str_replace(['&quot;', '&#34;', '&#x22;'], '"', $html);
-    $html = str_replace(['&#39;', '&#x27;', '&apos;'], "'", $html);
-
-    // Decode non-breaking space
-    $html = str_replace(['&nbsp;', '&#160;', '&#xa0;'], ' ', $html);
+    // Decode all HTML entities to their literal equivalents in a single pass.
+    // One strtr() call replaces 7 separate str_replace traversals — O(n) single-pass.
+    static $entity_map = null;
+    if ($entity_map === null) {
+        $entity_map = [
+            '&amp;' => '&', '&#038;' => '&', '&#38;' => '&', '&#x26;' => '&', '&#x026;' => '&',
+            '&quot;' => '"', '&#34;' => '"', '&#x22;' => '"',
+            '&#39;' => "'", '&#x27;' => "'", '&apos;' => "'",
+            '&nbsp;' => ' ', '&#160;' => ' ', '&#xa0;' => ' ',
+            '&#8220;' => '"', '&#8221;' => '"', '&#8216;' => "'", '&#8217;' => "'",
+            '&ldquo;' => '"', '&rdquo;' => '"', '&lsquo;' => "'", '&rsquo;' => "'",
+            "\xE2\x80\x9C" => '"', "\xE2\x80\x9D" => '"',
+            "\xE2\x80\x98" => "'", "\xE2\x80\x99" => "'",
+        ];
+    }
+    $html = strtr($html, $entity_map);
 
     // Convert XHTML self-closing tags to HTML5 style: <hr /> -> <hr>, <br /> -> <br>
     $html = preg_replace('/<(hr|br|img|input|meta|link)(\s[^>]*)?\s*\/>/i', '<$1$2>', $html);
 
-    // Normalize smart/curly quotes to straight quotes
-    // HTML entities for smart quotes
-    $html = str_replace(['&#8220;', '&#8221;', '&#8216;', '&#8217;'], ['"', '"', "'", "'"], $html);
-    // Named entities for smart quotes
-    $html = str_replace(['&ldquo;', '&rdquo;', '&lsquo;', '&rsquo;'], ['"', '"', "'", "'"], $html);
-    // Unicode smart quotes (using chr codes)
-    $html = str_replace(["\xE2\x80\x9C", "\xE2\x80\x9D", "\xE2\x80\x98", "\xE2\x80\x99"], ['"', '"', "'", "'"], $html);
-
-    // Normalize whitespace: collapse multiple spaces/newlines/tabs to single space
+    // Normalize whitespace: collapse to single spaces, then clean tag boundaries.
+    // After collapsing, all whitespace is single spaces, so str_replace suffices.
     $html = preg_replace('/\s+/', ' ', $html);
-    // Remove spaces before closing tags
-    $html = preg_replace('/\s+<\//', '</', $html);
-    // Remove spaces after opening tags
-    $html = preg_replace('/>\s+/', '>', $html);
+    $html = str_replace([' </', '> '], ['</', '>'], $html);
 
     return $html;
 }
-
-function gt_apply_elementor_translations($content) {
-    static $replacement_maps = [];
-    static $db_counts = [];
-
-    $post_id = get_the_ID();
-
-    if (!isset($replacement_maps[$post_id])) {
-        $replacement_maps[$post_id] = [];
-        $translations = gt_get_elementor_translations($post_id);
-        $db_counts[$post_id] = count($translations);
-        foreach ($translations as $t) {
-            if (!empty($t->translated_string) && !empty($t->original_string)) {
-                // Normalize the original string for matching
-                $normalized_original = gt_normalize_html($t->original_string);
-                $replacement_maps[$post_id][$normalized_original] = $t->translated_string;
-            }
-        }
-    }
-
-    $replacement_map = $replacement_maps[$post_id];
-
-    // Debug: add HTML comment showing translation status
-    if (isset($_GET['gt_debug']) && current_user_can('manage_options')) {
-        $db_count = $db_counts[$post_id] ?? 0;
-        $debug = "\n<!-- GT Debug: DB returned $db_count rows, map has " . count($replacement_map) . " entries for post $post_id -->\n";
-        if (!empty($replacement_map)) {
-            foreach ($replacement_map as $orig => $trans) {
-                $debug .= "<!-- GT Original (" . strlen($orig) . " chars): " . esc_html(substr($orig, 0, 60)) . "... -->\n";
-            }
-            $first_original = array_key_first($replacement_map);
-            $normalized_content = gt_normalize_html($content);
-            $debug .= "<!-- GT Content (100 chars): " . esc_html(substr($normalized_content, 0, 100)) . " -->\n";
-            $debug .= "<!-- GT Match found: " . (strpos($normalized_content, $first_original) !== false ? 'YES' : 'NO') . " -->\n";
-        }
-        $content = $debug . $content;
-    }
-
-    if (empty($replacement_map)) {
-        return $content;
-    }
-
-    // Use text-only replacement to avoid breaking HTML attributes (like data-settings JSON)
-    return gt_replace_text_only($content, $replacement_map);
-}
-
-// Filter Elementor widget content
-function gt_translate_elementor_widget($content, $widget) {
-    if (!gt_should_translate()) {
-        return $content;
-    }
-    return gt_apply_elementor_translations($content);
-}
-add_filter('elementor/widget/render_content', 'gt_translate_elementor_widget', 10, 2);
-
-// Single the_content filter for all translation (products + Elementor pages)
-function gt_translate_page_content($content) {
-    // Debug at the very start
-    if (isset($_GET['gt_debug']) && current_user_can('manage_options')) {
-        $current_lang = gt_get_current_language();
-        $target_lang = get_option('gt_target_language');
-        $should = gt_should_translate();
-        $is_elementor = defined('ELEMENTOR_VERSION') && \Elementor\Plugin::$instance->documents->get(get_the_ID());
-
-        $debug = "\n<!-- GT Debug START -->\n";
-        $debug .= "<!-- Current lang: $current_lang -->\n";
-        $debug .= "<!-- Target lang: $target_lang -->\n";
-        $debug .= "<!-- Should translate: " . ($should ? 'YES' : 'NO') . " -->\n";
-        $debug .= "<!-- Is Elementor page: " . ($is_elementor ? 'YES' : 'NO') . " -->\n";
-        $debug .= "<!-- Post ID: " . get_the_ID() . " -->\n";
-        $debug .= "<!-- GT Debug END -->\n";
-        $content = $debug . $content;
-    }
-
-    if (is_admin() || !gt_should_translate()) {
-        return $content;
-    }
-
-    // Product pages: translate entire content as a single string
-    if (is_product() || is_shop() || is_product_category()) {
-        return gt_get_translation($content);
-    }
-
-    // Elementor pages: apply string replacements
-    if (defined('ELEMENTOR_VERSION') && \Elementor\Plugin::$instance->documents->get(get_the_ID())) {
-        $content = gt_apply_elementor_translations($content);
-    }
-
-    return $content;
-}
-add_filter('the_content', 'gt_translate_page_content', 999, 1);

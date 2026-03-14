@@ -22,7 +22,7 @@ jQuery(document).ready(function ($) {
         $.post(gt_ajax.url, {
             action: 'gt_translate_batch',
             nonce: gt_ajax.nonce,
-            batch_size: 10
+            batch_size: 25
         }, function (response) {
             if (!response.success) {
                 $text.text('Error: ' + (response.data || 'Unknown error'));
