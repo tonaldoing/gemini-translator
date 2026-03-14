@@ -3,7 +3,7 @@
  * Plugin Name: Gemini Translator
  * Plugin URI: https://github.com/tonaldoing/gemini-translator
  * Description: Translate your WooCommerce store using Google Gemini AI
- * Version: 0.4.0
+ * Version: 0.4.1
  * Author: Tomás Vilas for Amrak Solutions
  * Author URI: https://github.com/tonaldoing
  * License: GPL v2 or later
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('GEMINI_TRANSLATOR_VERSION', '0.4.0');
+define('GEMINI_TRANSLATOR_VERSION', '0.4.1');
 define('GEMINI_TRANSLATOR_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('GEMINI_TRANSLATOR_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -2956,6 +2956,34 @@ function gt_get_url_rewrite_config() {
     return $config;
 }
 
+function gt_is_page_cacheable() {
+    if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+        return false;
+    }
+    if (is_user_logged_in()) {
+        return false;
+    }
+    if (function_exists('is_cart') && is_cart()) {
+        return false;
+    }
+    if (function_exists('is_checkout') && is_checkout()) {
+        return false;
+    }
+    if (function_exists('is_account_page') && is_account_page()) {
+        return false;
+    }
+    if (isset($_GET['gt_debug']) || isset($_GET['gt_clear_cache']) || isset($_GET['gt_search'])) {
+        return false;
+    }
+    return true;
+}
+
+function gt_get_page_cache_key() {
+    $target_lang = gt_get_target_language();
+    $cache_version = get_option('gt_cache_version', 1);
+    return 'gt_page_' . md5($cache_version . '|' . $target_lang . '|' . $_SERVER['REQUEST_URI']);
+}
+
 function gt_rewrite_html_urls($html) {
     $gt_debug = defined('WP_DEBUG') && WP_DEBUG;
     if ($gt_debug) {
@@ -2964,6 +2992,25 @@ function gt_rewrite_html_urls($html) {
 
     if (empty($html)) {
         return $html;
+    }
+
+    // Check page-level cache (skip all processing on cache hit)
+    $page_cacheable = gt_is_page_cacheable();
+    if ($page_cacheable) {
+        $page_cache_key = gt_get_page_cache_key();
+        $cached_html = wp_cache_get($page_cache_key, 'gt_pages');
+        if ($cached_html === false) {
+            $cached_html = get_transient($page_cache_key);
+            if ($cached_html !== false) {
+                wp_cache_set($page_cache_key, $cached_html, 'gt_pages', HOUR_IN_SECONDS);
+            }
+        }
+        if ($cached_html !== false) {
+            if ($gt_debug) {
+                error_log('[GT Performance] OB callback: served from page cache');
+            }
+            return $cached_html;
+        }
     }
 
     // Get pre-compiled config (cached)
@@ -2991,10 +3038,9 @@ function gt_rewrite_html_urls($html) {
             function ($m) use ($prefix, $target_lang, $config) {
                 $url_start = $m[2];
                 $path = $m[3];
-                $is_attr = ($m[1][0] !== '"'); // JSON "url" starts with quote, attr starts with letter
+                $is_attr = ($m[1][0] !== '"');
 
                 if ($url_start === '/') {
-                    // Relative URL
                     if ($is_attr && preg_match($config['already_prefixed'], ltrim($url_start . $path, '/'))) {
                         return $m[0];
                     }
@@ -3003,7 +3049,6 @@ function gt_rewrite_html_urls($html) {
                     }
                     return $m[1] . '/' . $target_lang . $url_start . $path;
                 } else {
-                    // Absolute URL
                     if ($is_attr && strpos($url_start . $path, $prefix) === 0) {
                         return $m[0];
                     }
@@ -3024,6 +3069,12 @@ function gt_rewrite_html_urls($html) {
     global $gt_buffer_post_id;
     if (!empty($gt_buffer_post_id)) {
         $html = gt_apply_translations_to_html($html, $gt_buffer_post_id);
+    }
+
+    // Store in page cache for next request
+    if ($page_cacheable && isset($page_cache_key)) {
+        wp_cache_set($page_cache_key, $html, 'gt_pages', HOUR_IN_SECONDS);
+        set_transient($page_cache_key, $html, HOUR_IN_SECONDS);
     }
 
     if ($gt_debug) {
@@ -3319,6 +3370,10 @@ function gt_invalidate_translation_cache() {
 
     // Reset static cache for current request
     gt_load_translation_cache(true);
+
+    // Invalidate page cache by bumping version (old transients expire naturally)
+    $version = get_option('gt_cache_version', 1);
+    update_option('gt_cache_version', $version + 1, true);
 }
 
 // Get translation for a string
@@ -3382,6 +3437,11 @@ function gt_frontend_switcher_css() {
         pointer-events: none;
         opacity: 0.85;
     }
+    .gt-language-switcher .gt-lang-btn.gt-loading {
+        opacity: 0.5;
+        cursor: wait;
+        pointer-events: none;
+    }
     .gt-language-switcher.gt-dropdown select option:disabled {
         color: #999;
     }
@@ -3419,9 +3479,52 @@ function gt_frontend_switcher_css() {
     }
     <?php endif; ?>
     </style>
+    <script>document.addEventListener('click',function(e){var b=e.target.closest('.gt-lang-btn:not(.active)');if(b){b.classList.add('gt-loading');}var s=e.target.closest('.gt-language-switcher select');if(s){s.style.opacity='0.5';s.style.cursor='wait';}});</script>
     <?php
 }
 add_action('wp_head', 'gt_frontend_switcher_css');
+
+// Prefetch the alternate language page for instant switching
+function gt_prefetch_alternate_language() {
+    if (is_admin()) {
+        return;
+    }
+
+    $current_lang = gt_get_current_language();
+    $source_lang = gt_get_source_language();
+    $target_lang = gt_get_target_language();
+
+    if (empty($target_lang)) {
+        return;
+    }
+
+    $current_path = trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
+
+    // Strip existing language prefix if present
+    if (strpos($current_path, $target_lang . '/') === 0 || $current_path === $target_lang) {
+        $current_path = substr($current_path, strlen($target_lang) + 1);
+    }
+
+    // Build the alternate language URL
+    remove_filter('home_url', 'gt_prefix_home_url', 10);
+    if ($current_lang === $source_lang) {
+        $alt_url = home_url('/' . $target_lang . '/' . $current_path);
+    } else {
+        $alt_url = home_url('/' . $current_path);
+    }
+    add_filter('home_url', 'gt_prefix_home_url', 10, 2);
+
+    // Prefetch (all browsers)
+    echo '<link rel="prefetch" href="' . esc_url($alt_url) . '">' . "\n";
+
+    // Speculation Rules API (Chrome 109+) — prerenders the page for truly instant navigation
+    ?>
+    <script type="speculationrules">
+    {"prerender": [{"urls": [<?php echo json_encode(esc_url($alt_url)); ?>], "eagerness": "eager"}]}
+    </script>
+    <?php
+}
+add_action('wp_head', 'gt_prefetch_alternate_language', 5);
 
 // Output frontend JavaScript for link interception (catches Elementor buttons, logo, etc.)
 function gt_frontend_link_interceptor() {
